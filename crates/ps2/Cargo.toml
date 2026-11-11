@@ -1,0 +1,9 @@
+[package]
+name = "ps2"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+repository = "https://github.com/mostazaniikkkk/PS2Rust"
+description = "Runtime de Rust para PlayStation 2: arranque, kernel del EE, consola, heap y Graphics Synthesizer"
+
+[dependencies]

@@ -1,0 +1,9 @@
+# `cargo ps2 …` desde la raíz del proyecto, sin instalar nada.
+[alias]
+ps2 = "run --quiet --release --manifest-path toolchain/cargo-ps2/Cargo.toml --"
+
+# `cargo ps2 run` busca el emulador en --emulator o en la variable de entorno
+# PCSX2_EXE. Puedes fijarla aquí para este proyecto, por ejemplo:
+#
+# [env]
+# PCSX2_EXE = "C:/PCSX2/pcsx2-qt.exe"

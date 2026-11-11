@@ -1,0 +1,11 @@
+[package]
+name = "selftest-host"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+repository = "https://github.com/mostazaniikkkk/PS2Rust"
+description = "Ejecuta la batería de pruebas en el PC para obtener la salida de referencia"
+
+[dependencies]
+
+[workspace]
