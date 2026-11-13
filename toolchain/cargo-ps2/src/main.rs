@@ -1,12 +1,16 @@
 //! `cargo ps2` — driver del compilador de Rust para PlayStation 2.
 //!
 //! Orquesta el `rustc` instalado (backend MIPS de LLVM) con un target propio
-//! (`mipsel-sony-ps2`), reconstruye `core`/`alloc` para él, enlaza con
-//! `rust-lld` y después legaliza y verifica el código máquina para el R5900.
+//! (`mipsel-sony-ps2`), prepara una copia de la std con la plataforma PS2
+//! (stdsrc.rs), la compila junto a `core`/`alloc`, enlaza con `rust-lld` y
+//! después legaliza y verifica el código máquina para el R5900 (r5900.rs,
+//! unaligned.rs).
 
 mod elf;
 mod emu;
 mod r5900;
+mod stdsrc;
+mod unaligned;
 
 use std::env;
 use std::fs;
@@ -19,7 +23,8 @@ const TARGET_JSON: &str = include_str!("../assets/mipsel-sony-ps2.json");
 const LINKER_SCRIPT: &str = include_str!("../assets/ps2.ld");
 
 const HELP: &str = "\
-cargo ps2 — compilador de Rust para PlayStation 2 (Emotion Engine / R5900)
+cargo ps2 — compilador de Rust para PlayStation 2 (Emotion Engine / R5900),
+con la biblioteca estándar (std) o sin ella (no_std).
 
 USO:
     cargo ps2 build [opciones] [-- <args extra de cargo>]
@@ -225,7 +230,9 @@ fn build(o: &Opts) -> Vec<PathBuf> {
     fs::create_dir_all(&support).unwrap_or_else(|e| die(format!("no pude crear {}: {e}", support.display())));
     fs::create_dir_all(&out_dir).unwrap_or_else(|e| die(format!("no pude crear {}: {e}", out_dir.display())));
     let spec = support.join(format!("{TARGET_NAME}.json"));
-    let script = support.join("ps2.ld");
+    // El nombre lleva un hash del contenido: si el script cambia, cambian los
+    // argumentos del enlazador y Cargo vuelve a enlazar.
+    let script = support.join(format!("ps2-{:016x}.ld", fnv1a(LINKER_SCRIPT.as_bytes())));
     write_if_changed(&spec, TARGET_JSON);
     write_if_changed(&script, LINKER_SCRIPT);
 
@@ -234,12 +241,17 @@ fn build(o: &Opts) -> Vec<PathBuf> {
         "target.{TARGET_NAME}.rustflags=['-Clink-arg=-T{script_arg}', '-Clink-arg=--gc-sections', '-Clink-arg=-znorelro']"
     );
 
+    let library = stdsrc::prepare(&support).unwrap_or_else(|e| die(e));
+
     let mut c = Command::new(cargo());
     c.arg("build");
     if !o.debug {
         c.arg("--release");
     }
-    c.args(["-Zbuild-std=core,alloc,compiler_builtins", "-Zbuild-std-features=compiler-builtins-mem"]);
+    // std (con la plataforma PS2), core, alloc y panic_abort, desde la copia
+    // parcheada de rust-src.
+    c.args(["-Zbuild-std=std,panic_abort", "-Zbuild-std-features=compiler-builtins-mem"]);
+    c.env("__CARGO_TESTS_ONLY_SRC_ROOT", &library);
     c.arg("-Zjson-target-spec");
     c.arg("--target").arg(&spec);
     c.arg("--config").arg(&rustflags);
@@ -288,6 +300,10 @@ fn build(o: &Opts) -> Vec<PathBuf> {
     elfs
 }
 
+fn fnv1a(data: &[u8]) -> u64 {
+    data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
 fn write_if_changed(path: &Path, content: &str) {
     if fs::read_to_string(path).map(|c| c == content).unwrap_or(false) {
         return;
@@ -307,8 +323,38 @@ fn process_elf(bytes: &mut [u8], apply: bool) -> Result<r5900::Report, String> {
         return Err(format!("el punto de entrada {:#010x} está fuera del programa", info.entry));
     }
     let mut rep = r5900::Report::default();
-    for c in &info.code {
+    for c in info.code.iter().chain(info.tramp.iter()) {
         r5900::process(&mut bytes[c.offset..c.offset + c.size], c.addr, apply, &mut rep);
+    }
+
+    // Cargas no alineadas: ver unaligned.rs.
+    let words = |c: &elf::CodeRange, b: &[u8]| -> (u32, Vec<u32>) {
+        let v = b[c.offset..c.offset + c.size].chunks(4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]])).collect();
+        (c.addr, v)
+    };
+    let mut code: Vec<(u32, Vec<u32>)> = info.code.iter().map(|c| words(c, bytes)).collect();
+    let mut tramp = info.tramp.as_ref().map(|c| words(c, bytes));
+    let data: Vec<u32> = info
+        .data
+        .iter()
+        .flat_map(|c| bytes[c.offset..c.offset + c.size].chunks_exact(4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]])))
+        .collect();
+    let fix = unaligned::fix(&mut code, &data, tramp.as_mut(), apply);
+    for (addr, msg) in fix.errors {
+        rep.errors.push(r5900::Issue { addr, word: 0, msg });
+    }
+    if fix.moved > 0 {
+        *rep.patched.entry("pareja lwl/lwr reagrupada").or_insert(0) += fix.moved;
+    }
+    if fix.trampolines > 0 {
+        *rep.patched.entry("lwl/lwr -> trampolín con extensión de signo").or_insert(0) += fix.trampolines;
+    }
+    let ranges: Vec<&elf::CodeRange> = info.code.iter().chain(info.tramp.iter()).collect();
+    let all: Vec<&(u32, Vec<u32>)> = code.iter().chain(tramp.iter()).collect();
+    for (c, (_, ws)) in ranges.iter().zip(all) {
+        for (i, w) in ws.iter().enumerate() {
+            bytes[c.offset + 4 * i..c.offset + 4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        }
     }
     Ok(rep)
 }

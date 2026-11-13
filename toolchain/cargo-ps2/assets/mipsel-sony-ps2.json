@@ -23,7 +23,7 @@
     "std": false,
     "tier": 3
   },
-  "os": "none",
+  "os": "ps2",
   "panic-strategy": "abort",
   "relocation-model": "static",
   "target-pointer-width": 32,

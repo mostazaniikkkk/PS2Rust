@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ps2", "examples/hello", "examples/selftest", "examples/cube", "examples/panic"]
+members = ["crates/ps2", "examples/hello", "examples/selftest", "examples/cube", "examples/panic", "examples/std-hello", "examples/std-selftest", "examples/std-panic"]
 exclude = ["toolchain"]
 
 [profile.release]

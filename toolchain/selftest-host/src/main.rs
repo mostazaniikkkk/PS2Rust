@@ -1,20 +1,39 @@
-//! Ejecuta en el PC la misma batería que corre en la PlayStation 2. Su salida
-//! es la referencia contra la que se compara, línea por línea, la de la consola.
+//! Ejecuta en el PC las mismas baterías que corren en la PlayStation 2. Su
+//! salida es la referencia contra la que se compara, línea por línea, la de
+//! la consola.
+//!
+//! * sin argumentos: batería de `core`/`alloc` en texto normal.
+//! * `--escaped`: la misma, con la codificación `%XX` de la consola.
+//! * `--std`: `core`/`alloc` + std, codificada, como `std-selftest`.
+//!   Usa el directorio actual para las pruebas de archivos.
 
 extern crate alloc;
 
 #[path = "../../../examples/selftest/src/suite.rs"]
 mod suite;
+#[path = "../../../examples/std-selftest/src/std_suite.rs"]
+mod std_suite;
+
+use std::fmt::Write as _;
 
 fn main() {
     let env = suite::Env { sqrt: f32::sqrt };
-    // Con --escaped la salida usa la misma codificación %XX que la consola.
     let escaped = std::env::args().any(|a| a == "--escaped");
-    let mut out = String::new();
-    let failed = if escaped {
-        suite::run(&mut suite::Escaped(&mut out), &env)
+    let with_std = std::env::args().any(|a| a == "--std");
+    let mut core_out = String::new();
+    let mut failed = suite::run(&mut core_out, &env);
+    let mut raw = core_out;
+    if with_std {
+        let (std_out, std_failed) = std_suite::run();
+        raw.push_str(&std_out);
+        failed += std_failed;
+    }
+    let out = if escaped || with_std {
+        let mut s = String::new();
+        let _ = suite::Escaped(&mut s).write_str(&raw);
+        s
     } else {
-        suite::run(&mut out, &env)
+        raw
     };
     print!("{out}");
     std::process::exit(failed as i32);

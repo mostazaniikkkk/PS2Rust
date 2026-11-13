@@ -1,42 +1,79 @@
 # PS2Rust — Rust para PlayStation 2
 
-Compila programas en Rust a ejecutables ELF para el Emotion Engine (MIPS R5900)
-de la PlayStation 2. No usa C ni PS2SDK: el arranque, las llamadas al kernel, el
-heap y los gráficos están escritos en Rust.
+Compila programas en Rust, **con la biblioteca estándar**, a ejecutables ELF
+para el Emotion Engine (MIPS R5900) de la PlayStation 2. No usa C ni PS2SDK:
+el arranque, el kernel, la comunicación con el procesador de E/S, los hilos,
+los archivos y los gráficos están escritos en Rust.
 
-| [`cube`](examples/cube/src/main.rs) | [`hello`](examples/hello/src/main.rs) |
-|---|---|
-| ![Cubo con sombreado Gouraud en PCSX2](docs/cube.png) | ![Texto en pantalla en PCSX2](docs/hello.png) |
+| [`std-hello`](examples/std-hello/src/main.rs) | [`cube`](examples/cube/src/main.rs) | [`hello`](examples/hello/src/main.rs) |
+|---|---|---|
+| ![Hilos, archivos y reloj con la std](docs/std-hello.png) | ![Cubo con sombreado Gouraud](docs/cube.png) | ![Texto en pantalla](docs/hello.png) |
 
 ```rust
-#![no_std]
-#![no_main]
-use ps2::println;
-
-ps2::entry!(main);
+use std::{fs, thread, collections::HashMap, time::Duration};
 
 fn main() {
-    println!("Hola desde Rust en una PlayStation 2");
+    let worker = thread::spawn(|| (1..=10u32).map(|n| n * n).sum::<u32>());
+    let mut save = HashMap::new();
+    save.insert("nivel", worker.join().unwrap());
+    fs::write("partida.txt", format!("{save:?}")).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    println!("{}", fs::read_to_string("partida.txt").unwrap());
 }
 ```
 
 ```
-cargo ps2 run -p hello
+cargo ps2 run -p std-hello
 ```
+
+## La biblioteca estándar en la PS2
+
+| Módulo | En la PS2 |
+|---|---|
+| `std::thread` | Hilos del kernel del EE: `spawn`, `join`, `scope`, `Builder`, `park`/`unpark`, `sleep`, `yield_now`, `thread_local!` (con destructores) |
+| `std::sync` | `Mutex`, `Condvar`, `RwLock`, `Once`, `OnceLock`, `LazyLock`, `Barrier`, `mpsc`, atómicos; todo sobre un futex propio |
+| `std::time` | `Instant` con el contador de ciclos (resolución de 3,4 ns); `SystemTime` con el reloj de tiempo real de la consola |
+| `std::fs` | `host:` (el PC, con PCSX2 o ps2link), `mc0:`/`mc1:` (tarjetas de memoria; los módulos se cargan solos), `cdrom0:` (el disco). Leer, escribir, `seek`, `append`, `metadata`, `read_dir`, `create_dir_all`, `remove_*`, `copy`, `rename` |
+| `std::io` | `stdout`/`stderr` a la consola del EE; `stdin` siempre vacío |
+| `std::env` | `args` (el kernel los pasa), variables en memoria, `current_dir`/`set_current_dir` (al empezar, el directorio del ELF) |
+| `std::collections` | Todo, incluidos `HashMap`/`HashSet` con semillas aleatorias |
+| `std::process` | `exit` y `abort`; no hay `Command` |
+| `std::net` | No disponible (no hay pila de red) |
+| `std::os::ps2` | `load_iop_module`, `SifRpcClient` (llamadas RPC a módulos del IOP: mandos, sonido…), `reset_iop` (reinicia el IOP con los módulos de la BIOS), `cpu_cycles`, `heap_free_bytes` |
+
+Un pánico (en cualquier hilo) imprime el mensaje y termina con código 101: se
+compila con `panic = "abort"`, no hay desenrollado.
+
+Los hilos son **cooperativos**: todos tienen la misma prioridad en el kernel,
+así que un hilo corre hasta que se bloquea (E/S, `Mutex`, canal, `join`),
+duerme o llama a `thread::yield_now`. Es el modelo habitual de los juegos de
+PS2, y además hace correctos los atómicos del R5900 (ver más abajo).
 
 ## Cómo funciona
 
 No es un fork de `rustc`. Es el `rustc` que ya tienes instalado, dirigido a un
-target nuevo, más un paso propio que adapta el código máquina al R5900:
+target nuevo, más pasos propios antes y después de compilar:
 
-1. **Target `mipsel-sony-ps2`** ([spec](toolchain/cargo-ps2/assets/mipsel-sony-ps2.json)):
-   MIPS II little-endian, ABI o32, FPU de precisión simple (`f64` por software),
-   sin PIC, y con el relleno de delay slots de LLVM desactivado para esquivar la
-   errata de bucles cortos del R5900.
-2. **`core` y `alloc` se recompilan** para ese target con `-Zbuild-std`.
-3. **Enlazado** con `rust-lld` y un [linker script](toolchain/cargo-ps2/assets/ps2.ld)
+1. **Target `mipsel-sony-ps2`** ([spec](toolchain/cargo-ps2/assets/mipsel-sony-ps2.json)),
+   con `target_os = "ps2"`: MIPS II little-endian, ABI o32, FPU de precisión
+   simple (`f64` por software), sin PIC, y con el relleno de delay slots de
+   LLVM desactivado para esquivar la errata de bucles cortos del R5900.
+2. **La std con una plataforma nueva.** `cargo ps2` copia el código de la std
+   de tu toolchain (`rust-src`) a `target/ps2-toolchain/`, añade la rama
+   `target_os = "ps2"` en cada selector de plataforma (24 inserciones,
+   [stdsrc.rs](toolchain/cargo-ps2/src/stdsrc.rs), cada una comprobada contra
+   el original) y le suma la implementación de
+   [toolchain/std-ps2](toolchain/std-ps2). Luego compila `std`, `core`,
+   `alloc` y `panic_abort` con `-Zbuild-std`.
+3. **El sistema operativo, en Rust** ([std-ps2/os](toolchain/std-ps2/os)):
+   syscalls del kernel del EE; el protocolo SIF (comandos y RPC por DMA)
+   para hablar con el IOP; los servidores de la BIOS FILEIO (archivos),
+   LOADFILE (módulos) y CDVD (reloj); un temporizador de 1 kHz sobre el
+   Timer 1 que extiende el contador de ciclos a 64 bits y despierta a los
+   hilos dormidos; un futex; y el heap.
+4. **Enlazado** con `rust-lld` y un [linker script](toolchain/cargo-ps2/assets/ps2.ld)
    que carga el programa en `0x00100000`.
-4. **Legalización para el R5900** ([r5900.rs](toolchain/cargo-ps2/src/r5900.rs)).
+5. **Legalización para el R5900** ([r5900.rs](toolchain/cargo-ps2/src/r5900.rs)).
    LLVM no conoce el R5900, así que el ELF enlazado se parchea in situ:
 
    | LLVM emite | El R5900 | Se reescribe como |
@@ -45,22 +82,45 @@ target nuevo, más un paso propio que adapta el código máquina al R5900:
    | `c.ult.s`, `c.ule.s`, `c.un.s`… | sólo C.F, C.EQ, C.LT, C.LE | la variante ordenada (su FPU no tiene NaN) |
    | `trunc.w.s` | no existe | `cvt.w.s` (en el R5900 siempre trunca) |
    | `sqrt.s fd, fs` | el operando va en `ft` | mismo opcode, campo movido |
+   | `lwl` + `lwr` cuyo valor se usa en cálculos | ver abajo | desvío a un trampolín que añade `sll rt, rt, 0` |
 
-5. **Verificación**: se decodifica cada instrucción del ELF final. Lo que el
-   R5900 no implementa (`dmult`, `ddiv`, `movf`, dobles en FPU, `ldc1`…) o un
-   bucle corto con el delay slot ocupado hacen fallar la compilación.
+6. **Verificación**: se decodifica cada instrucción del ELF final. Lo que el
+   R5900 no implementa (`dmult`, `ddiv`, `movf`, dobles en FPU, `ldc1`…), un
+   bucle corto con el delay slot ocupado o una carga no alineada sin corregir
+   hacen fallar la compilación.
 
 Todo eso lo orquesta `cargo ps2`, un binario sin dependencias en
 [toolchain/cargo-ps2](toolchain/cargo-ps2).
+
+### Las cargas no alineadas y el recompilador de PCSX2
+
+El R5900 tiene registros de 64 bits: el código de 32 bits funciona porque cada
+instrucción deja el resultado con el signo extendido a los 64 bits. Con la std
+apareció un cuelgue intermitente dentro de `HashMap`: el recompilador del EE de
+PCSX2 no extiende el signo en las cargas no alineadas `lwl` + `lwr` (deja ceros
+arriba), y las comparaciones de 64 bits del bucle de búsqueda nunca terminaban.
+El intérprete de PCSX2 sí lo hace bien.
+
+La corrección está en [unaligned.rs](toolchain/cargo-ps2/src/unaligned.rs):
+un análisis de flujo comprueba, por todos los caminos, si el valor cargado sólo
+se escribe a memoria (las copias, que son la mayoría); si no, la pareja se
+desvía a un trampolín que la ejecuta en su orden y añade `sll rt, rt, 0`. Si
+entre las dos mitades hay otras instrucciones, se reagrupan cuando se puede
+demostrar que es seguro (no tocan el registro ni la base, y ninguna es destino
+de un salto, contando las tablas de saltos de los datos).
 
 ## Requisitos
 
 - Rust estable con el componente `rust-src` (`rustup component add rust-src`).
   Probado con rustc 1.97.1. `cargo ps2` activa `RUSTC_BOOTSTRAP=1` porque el
   target JSON, `build-std` y el ensamblador en línea para MIPS son inestables.
+  Si una versión futura de Rust cambia los archivos de la std que se parchean,
+  `cargo ps2` lo detecta y lo dice en vez de compilar algo roto.
 - Para `cargo ps2 run`: PCSX2 con una BIOS (la BIOS no se incluye: vuélcala de
   tu consola). La ruta del emulador se toma de `--emulator` o de la variable de
   entorno `PCSX2_EXE`; también se puede fijar en [.cargo/config.toml](.cargo/config.toml).
+  Para que `host:` funcione, PCSX2 necesita la opción *Host Filesystem*
+  activada.
 
 ## Uso
 
@@ -68,12 +128,15 @@ Desde la raíz de este repositorio no hay que instalar nada (hay un alias en
 `.cargo/config.toml`):
 
 ```
+cargo ps2 run -p std-hello         # compila y ejecuta en PCSX2, mostrando la consola
 cargo ps2 build -p cube            # compila -> target/ps2/cube.elf
-cargo ps2 run -p hello             # compila y ejecuta en PCSX2, mostrando la consola
 cargo ps2 run -p cube --until "240 frames" --screenshot cube.png
 cargo ps2 check juego.elf          # ¿este ELF sólo usa instrucciones del R5900?
 cargo ps2 help
 ```
+
+Compila los paquetes de uno en uno (`-p`): los ejemplos sin std y con std usan
+el crate `ps2` con features distintas.
 
 Para usarlo en un proyecto propio, fuera de este repositorio:
 
@@ -84,7 +147,8 @@ cargo install --git https://github.com/mostazaniikkkk/PS2Rust cargo-ps2
 ```toml
 # Cargo.toml de tu proyecto
 [dependencies]
-ps2 = { git = "https://github.com/mostazaniikkkk/PS2Rust" }
+# Gráficos y hardware; sin el runtime no_std, porque lo pone la std.
+ps2 = { git = "https://github.com/mostazaniikkkk/PS2Rust", default-features = false }
 
 [profile.release]
 panic = "abort"
@@ -93,61 +157,69 @@ panic = "abort"
 El `.elf` resultante se puede cargar en PCSX2 (Sistema → Ejecutar ELF) o en una
 consola con un lanzador de homebrew.
 
-## El runtime (`crates/ps2`)
+## El crate `ps2`
+
+El hardware que la std no cubre. Con la std se usa con
+`default-features = false`; sin std (`#![no_std]`), la feature `rt` (por
+defecto) añade el arranque, el asignador, el manejador de pánicos y
+`ps2::entry!`.
 
 | Módulo | Qué ofrece |
 |---|---|
-| `ps2::entry!` | Punto de entrada; `main` devuelve `()` o un `i32` |
-| `print!` / `println!` | Consola del EE (puerto serie; PCSX2 la muestra en su log) |
-| `heap` | Asignador global: `Vec`, `String`, `Box`, `Rc`, `Arc`, `BTreeMap`… sobre los ~30 MiB libres |
 | `gs` | Graphics Synthesizer: NTSC/PAL, doble búfer, vsync, rectángulos, líneas, triángulos Gouraud, mezcla alfa, texto |
 | `math` | `sqrt`, `sin`, `cos`, `floor` en `f32` sobre la FPU |
-| `time` | Contador de ciclos de la CPU, microsegundos |
 | `kernel` | Syscalls del kernel del EE y registros de hardware de 32 y 64 bits |
-
-Un pánico imprime el mensaje por la consola, pone el fondo en rojo y termina
-con código 101.
+| `print!` / `println!` | Consola del EE, también sin std |
+| `entry!`, `heap`, `exit` | Sólo con `rt`: el runtime de los programas `no_std` |
 
 ## Ejemplos
 
-- [hello](examples/hello/src/main.rs): consola, heap, flotantes y texto en pantalla.
-- [cube](examples/cube/src/main.rs): cubo con sombreado Gouraud a 60 fps, toda la geometría en `f32`.
-- [selftest](examples/selftest/src/suite.rs): batería de 33 comprobaciones y 144 líneas de salida.
-- [panic](examples/panic/src/main.rs): acceso fuera de rango detectado en la consola.
+- [std-hello](examples/std-hello/src/main.rs): cuatro hilos y un canal, `HashMap`, un archivo, el reloj de la consola y el resultado en pantalla.
+- [std-selftest](examples/std-selftest/src/std_suite.rs): batería de la std (25 comprobaciones, más las 33 de `core`/`alloc`).
+- [std-panic](examples/std-panic/src/main.rs): pánico en un hilo con nombre.
+- [hello](examples/hello/src/main.rs), [cube](examples/cube/src/main.rs), [selftest](examples/selftest/src/suite.rs), [panic](examples/panic/src/main.rs): los mismos temas sin std (`#![no_std]`).
 
 ## Verificación
 
 ```
-powershell -ExecutionPolicy Bypass -File verify.ps1 -Emulator C:uta\pcsx2-qt.exe
+powershell -ExecutionPolicy Bypass -File verify.ps1 -Emulator C:\ruta\pcsx2-qt.exe
 ```
 
-El script compila todo, lo ejecuta en PCSX2 y comprueba los resultados. La
-prueba principal es diferencial: [suite.rs](examples/selftest/src/suite.rs) se
-compila tal cual para el PC y para la PS2, y las dos salidas deben coincidir
-byte a byte. Cubre enteros de 32/64/128 bits, `f64` por software, `f32` en la
-FPU, formato, colecciones, `Rc`/`Arc`, atómicos, estrés del heap, cadenas
-UTF-8, genéricos, closures, iteradores y varios algoritmos.
+El script compila los siete ejemplos, los ejecuta en PCSX2 y comprueba los
+resultados (10 pasos). Las pruebas principales son diferenciales: las baterías
+se compilan tal cual para el PC y para la PS2, y las dos salidas deben
+coincidir byte a byte (212 líneas con la std). Cubren enteros de 32/64/128
+bits, `f64` por software, `f32` en la FPU, formato, colecciones, `Rc`/`Arc`,
+atómicos, el heap, UTF-8, hilos, `Mutex`/`Condvar`/`RwLock`/`Barrier`,
+canales, `thread_local!`, `sleep`, `SystemTime`, archivos (incluidos nombres
+de 1 a 16 caracteres) y el entorno.
 
 ## Límites conocidos
 
-- **Probado sólo en emuladores** (PCSX2 2.7.513 con BIOS real y Play! 0.47), no
-  en una consola física.
+- **Probado sólo en emuladores** (PCSX2 2.7.513 con BIOS real, y Play! 0.47 la
+  versión sin std), no en una consola física.
+- **Hilos cooperativos.** No hay reparto de tiempo: un hilo que calcula sin
+  bloquearse ni ceder no deja correr a los demás. Los atómicos se compilan como
+  `lw`/`sw` (el R5900 no tiene `ll`/`sc`); son correctos porque ningún hilo
+  pierde la CPU en medio de una operación y los manejadores de interrupción no
+  los usan.
 - **ABI o32 de 32 bits.** No se puede enlazar con las bibliotecas C de PS2SDK
-  (que usan n32). `u64` e `i64` funcionan pero se calculan con pares de
-  registros de 32 bits; no hay acceso a los registros de 128 bits (MMI) ni a
-  las unidades vectoriales.
-- **Atómicos de un solo núcleo.** `lw`/`sw` no es atómico frente a una
-  interrupción que modifique el mismo dato. El runtime no instala manejadores
-  de interrupción ni crea hilos, así que dentro de él es correcto; si añades
-  interrupciones, no compartas con ellas atómicos de lectura-modificación-escritura.
+  (que usan n32). `u64` funciona pero con pares de registros; no hay acceso a
+  los registros de 128 bits (MMI) ni a las unidades vectoriales.
 - **`f32` sigue la FPU de la PS2**, no IEEE 754: sin NaN, infinitos ni
   denormales, y redondeo hacia cero. `f64` sí es IEEE 754 (por software, lento).
-- **Sin `std`**: sólo `core` y `alloc`. No hay mando, sonido, tarjeta de memoria
-  ni archivos; todo eso vive en el procesador de E/S (IOP) y necesita SIF RPC.
+- **Archivos**: el FILEIO de la BIOS no sabe renombrar (`rename` copia y borra,
+  no es atómico), ni bloquear, truncar o cambiar fechas y permisos. Un archivo
+  abierto no se puede borrar en `host:`. Las fechas de la PS2 están en hora de
+  Japón; las de los archivos de `host:` con PCSX2 llegan en la hora local del
+  PC, así que `modified()` puede desfasarse unas horas.
+- **Sin `std::net`, `std::process::Command` ni `stdin`.** El mando y el sonido
+  tampoco están: viven en el IOP y necesitan sus propios módulos.
 - PCSX2 decodifica la consola del EE como Shift-JIS: el texto no ASCII, `\` y
   `~` se pierden en su log (no en pantalla; `gs::text` dibuja `ñ`, `¡` y `¿`).
 
 ## Licencia
 
 [CC0 1.0](LICENSE): dominio público. Haz lo que quieras con esto, sin pedir
-permiso ni dar crédito.
+permiso ni dar crédito. La std que `cargo ps2` genera en `target/` es una copia
+modificada de la de Rust y conserva su licencia (MIT o Apache 2.0).

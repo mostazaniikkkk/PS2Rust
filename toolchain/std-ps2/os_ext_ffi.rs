@@ -1,0 +1,9 @@
+//! Conversión entre `OsStr` y bytes: en la PS2 las rutas son bytes.
+
+#![stable(feature = "rust1", since = "1.0.0")]
+
+#[path = "../unix/ffi/os_str.rs"]
+mod os_str;
+
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use self::os_str::{OsStrExt, OsStringExt};

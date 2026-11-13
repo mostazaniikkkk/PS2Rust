@@ -1,0 +1,8 @@
+[package]
+name = "std-selftest"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+repository = "https://github.com/mostazaniikkkk/PS2Rust"
+
+[dependencies]

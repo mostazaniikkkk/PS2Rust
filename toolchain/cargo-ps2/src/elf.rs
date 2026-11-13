@@ -10,6 +10,10 @@ pub struct CodeRange {
 pub struct Elf {
     pub entry: u32,
     pub code: Vec<CodeRange>,
+    /// Sección `.ps2tramp` (trampolines del legalizador), si existe.
+    pub tramp: Option<CodeRange>,
+    /// Secciones de datos inicializados (para buscar tablas de saltos).
+    pub data: Vec<CodeRange>,
     pub load_start: u32,
     pub load_end: u32,
 }
@@ -70,6 +74,8 @@ pub fn parse(b: &[u8]) -> Result<Elf, String> {
     }
 
     let mut code = Vec::new();
+    let mut tramp = None;
+    let mut data = Vec::new();
     if shoff != 0 && shnum != 0 {
         let strtab = {
             let s = shoff + shstrndx * shentsize;
@@ -83,14 +89,18 @@ pub fn parse(b: &[u8]) -> Result<Elf, String> {
             let addr = u32le(b, s + 12)?;
             let offset = u32le(b, s + 16)? as usize;
             let size = u32le(b, s + 20)? as usize;
-            // SHT_PROGBITS con SHF_ALLOC | SHF_EXECINSTR
-            if ty == 1 && flags & 4 != 0 && flags & 2 != 0 && size > 0 {
-                let name = b
-                    .get(strtab.0 + name_off..strtab.0 + strtab.1)
-                    .and_then(|s| s.split(|&c| c == 0).next())
-                    .map(|s| String::from_utf8_lossy(s).into_owned())
-                    .unwrap_or_default();
+            let name = b
+                .get(strtab.0 + name_off..strtab.0 + strtab.1)
+                .and_then(|s| s.split(|&c| c == 0).next())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .unwrap_or_default();
+            if name == ".ps2tramp" && ty == 1 && size > 0 {
+                tramp = Some(CodeRange { name, offset, size, addr });
+            } else if ty == 1 && flags & 4 != 0 && flags & 2 != 0 && size > 0 {
+                // SHT_PROGBITS con SHF_ALLOC | SHF_EXECINSTR
                 code.push(CodeRange { name, offset, size, addr });
+            } else if ty == 1 && flags & 2 != 0 && size > 0 && offset + size <= b.len() {
+                data.push(CodeRange { name, offset, size, addr });
             }
         }
     }
@@ -100,10 +110,10 @@ pub fn parse(b: &[u8]) -> Result<Elf, String> {
         return Err("el ELF no tiene tabla de secciones (¿strip total?): no puedo distinguir código de datos".into());
     }
     let _ = exec_segments;
-    for c in &code {
+    for c in code.iter().chain(tramp.iter()) {
         if c.offset + c.size > b.len() {
             return Err(format!("la sección {} se sale del archivo", c.name));
         }
     }
-    Ok(Elf { entry, code, load_start, load_end })
+    Ok(Elf { entry, code, tramp, data, load_start, load_end })
 }

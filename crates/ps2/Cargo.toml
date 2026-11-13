@@ -7,3 +7,9 @@ repository = "https://github.com/mostazaniikkkk/PS2Rust"
 description = "Runtime de Rust para PlayStation 2: arranque, kernel del EE, consola, heap y Graphics Synthesizer"
 
 [dependencies]
+
+[features]
+default = ["rt"]
+# Runtime para programas `no_std`: arranque, asignador, pánicos y `entry!`.
+# Desactívala (`default-features = false`) en programas que usan la std.
+rt = []

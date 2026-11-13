@@ -13,10 +13,22 @@ SECTIONS
 {
   . = 0x00100000;
 
+  /* Huecos entre funciones: nop (lld rellena con una trampa de MIPS R6 que
+   * el R5900 no conoce). */
   .text : ALIGN(16)
   {
     KEEP(*(.text.start))
     *(.text .text.*)
+  } :text =0x00000000
+
+  /* Trampolines que añade cargo-ps2 al legalizar cargas no alineadas
+   * (ver unaligned.rs). 64 KiB: 2048 trampolines de 32 bytes. */
+  .ps2tramp : ALIGN(16)
+  {
+    __ps2tramp_start = .;
+    LONG(0);
+    . = __ps2tramp_start + 0x10000;
+    __ps2tramp_end = .;
   } :text
 
   .rodata : ALIGN(16)

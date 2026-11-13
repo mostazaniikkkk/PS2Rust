@@ -1,6 +1,6 @@
 # Verificación completa del compilador de Rust para PlayStation 2.
 #
-#   powershell -ExecutionPolicy Bypass -File verify.ps1 -Emulator C:uta\pcsx2-qt.exe
+#   powershell -ExecutionPolicy Bypass -File verify.ps1 -Emulator C:\PCSX2\pcsx2-qt.exe
 #
 # Compila todo, ejecuta los programas en PCSX2 y comprueba los resultados.
 # Necesita PCSX2 con BIOS: -Emulator <pcsx2-qt.exe> o la variable PCSX2_EXE.
@@ -9,7 +9,7 @@ param([string]$Emulator = $env:PCSX2_EXE)
 
 $ErrorActionPreference = 'Stop'
 if (-not $Emulator -or -not (Test-Path $Emulator)) {
-    Write-Host 'Indica PCSX2: verify.ps1 -Emulator C:uta\pcsx2-qt.exe (o define PCSX2_EXE)' -ForegroundColor Red
+    Write-Host 'Indica PCSX2: verify.ps1 -Emulator C:\PCSX2\pcsx2-qt.exe (o define PCSX2_EXE)' -ForegroundColor Red
     exit 1
 }
 $env:PCSX2_EXE = (Resolve-Path $Emulator).Path
@@ -27,10 +27,24 @@ function Step([string]$name, [scriptblock]$body) {
 }
 
 # Ejecuta `cargo <argumentos>` y devuelve su codigo de salida; stdout/stderr a archivos.
-function Run([string]$arguments, [string]$stdout, [string]$stderr) {
+function Run([string]$arguments, [string]$stdout, [string]$stderr, [string]$dir = $PSScriptRoot) {
     $p = Start-Process -FilePath 'cargo' -ArgumentList $arguments -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WorkingDirectory $dir
     return $p.ExitCode
+}
+
+# Compara la salida del PC con la de la PS2 desde la primera linea esperada.
+function SameOutput([string]$expectedFile, [string]$actualFile) {
+    $expected = @(Get-Content $expectedFile -Encoding UTF8)
+    $actual = @(Get-Content $actualFile -Encoding UTF8)
+    $start = [array]::IndexOf($actual, $expected[0])
+    if ($start -lt 0) { Write-Host '  la PS2 no imprimio el inicio de la bateria'; return $false }
+    $actual = @($actual[$start..($actual.Count - 1)])
+    $diff = @(Compare-Object $expected $actual -SyncWindow 0)
+    Write-Host "  PC: $($expected.Count) lineas; PS2: $($actual.Count) lineas; diferencias: $($diff.Count)"
+    Write-Host "  $($actual[-1])"
+    $diff | Select-Object -First 10 | ForEach-Object { Write-Host "  $($_.SideIndicator) $($_.InputObject)" }
+    ($diff.Count -eq 0) -and ($expected.Count -eq $actual.Count)
 }
 
 Step 'Pruebas unitarias del legalizador R5900' {
@@ -39,9 +53,11 @@ Step 'Pruebas unitarias del legalizador R5900' {
     $code -eq 0
 }
 
-Step 'Compilar los cuatro ejemplos para PS2' {
+$examples = 'hello', 'selftest', 'cube', 'panic-demo', 'std-hello', 'std-selftest', 'std-panic'
+
+Step 'Compilar los siete ejemplos para PS2 (cuatro sin std, tres con std)' {
     $ok = $true
-    foreach ($p in 'hello', 'selftest', 'cube', 'panic-demo') {
+    foreach ($p in $examples) {
         $code = Run "ps2 build -p $p" "$out\build-$p.txt" "$out\build-$p.err"
         Get-Content "$out\build-$p.err" | Select-String 'R5900:' | ForEach-Object { Write-Host "  $p`: $($_.Line.Trim())" }
         if ($code -ne 0) { $ok = $false; Get-Content "$out\build-$p.err" | Select-Object -Last 15 | Write-Host }
@@ -51,25 +67,29 @@ Step 'Compilar los cuatro ejemplos para PS2' {
 
 Step 'El verificador rechaza el ELF sin legalizar y acepta el legalizado' {
     $raw = Run 'ps2 check target\mipsel-sony-ps2\release\selftest' "$out\check-raw.txt" "$out\check-raw.err"
-    $fixed = Run 'ps2 check target\ps2\selftest.elf target\ps2\hello.elf target\ps2\cube.elf target\ps2\panic-demo.elf' "$out\check-ok.txt" "$out\check-ok.err"
+    $elfs = ($examples | ForEach-Object { "target\ps2\$_.elf" }) -join ' '
+    $fixed = Run "ps2 check $elfs" "$out\check-ok.txt" "$out\check-ok.err"
     Get-Content "$out\check-raw.err" | Select-Object -First 1 | ForEach-Object { Write-Host "  $_" }
     Get-Content "$out\check-ok.txt" | ForEach-Object { Write-Host "  $_" }
     ($raw -ne 0) -and ($fixed -eq 0)
 }
 
-Step 'Bateria de pruebas: salida de la PS2 identica a la del PC' {
+Step 'Bateria core/alloc (no_std): salida de la PS2 identica a la del PC' {
     $hostCode = Run 'run --release -q --manifest-path toolchain\selftest-host\Cargo.toml -- --escaped' "$out\selftest.expected.txt" "$out\selftest-host.err"
     $ps2Code = Run "ps2 run -p selftest --timeout 180 --log `"$out\selftest.actual.txt`"" "$out\selftest.stdout.txt" "$out\selftest.err"
-    $expected = @(Get-Content "$out\selftest.expected.txt" -Encoding UTF8)
-    $actual = @(Get-Content "$out\selftest.actual.txt" -Encoding UTF8)
-    $start = [array]::IndexOf($actual, $expected[0])
-    if ($start -lt 0) { Write-Host '  la PS2 no imprimio el inicio de la bateria'; return $false }
-    $actual = @($actual[$start..($actual.Count - 1)])
-    $diff = @(Compare-Object $expected $actual -SyncWindow 0)
-    Write-Host "  PC: $($expected.Count) lineas (exit $hostCode); PS2: $($actual.Count) lineas (exit $ps2Code); diferencias: $($diff.Count)"
-    Write-Host "  $($actual[-1])"
-    $diff | Select-Object -First 10 | ForEach-Object { Write-Host "  $($_.SideIndicator) $($_.InputObject)" }
-    ($hostCode -eq 0) -and ($ps2Code -eq 0) -and ($diff.Count -eq 0) -and ($expected.Count -eq $actual.Count)
+    $same = SameOutput "$out\selftest.expected.txt" "$out\selftest.actual.txt"
+    Write-Host "  exit PC $hostCode, PS2 $ps2Code"
+    ($hostCode -eq 0) -and ($ps2Code -eq 0) -and $same
+}
+
+Step 'Bateria std (hilos, sync, tiempo, archivos, entorno): PS2 identica al PC' {
+    # El PC usa el mismo directorio que ve la PS2 como host: (el del ELF).
+    $manifest = Join-Path $PSScriptRoot 'toolchain\selftest-host\Cargo.toml'
+    $hostCode = Run "run --release -q --manifest-path `"$manifest`" -- --std" "$out\std-selftest.expected.txt" "$out\std-selftest-host.err" $out
+    $ps2Code = Run "ps2 run -p std-selftest --timeout 240 --log `"$out\std-selftest.actual.txt`"" "$out\std-selftest.stdout.txt" "$out\std-selftest.err"
+    $same = SameOutput "$out\std-selftest.expected.txt" "$out\std-selftest.actual.txt"
+    Write-Host "  exit PC $hostCode, PS2 $ps2Code"
+    ($hostCode -eq 0) -and ($ps2Code -eq 0) -and $same -and -not (Test-Path "$out\std_selftest_tmp")
 }
 
 Step 'Panico: mensaje por consola y codigo de salida 101' {
@@ -77,6 +97,20 @@ Step 'Panico: mensaje por consola y codigo de salida 101' {
     $text = Get-Content "$out\panic.txt" -Raw
     Get-Content "$out\panic.txt" | ForEach-Object { Write-Host "  $_" }
     ($code -eq 101) -and ($text -match 'index out of bounds: the len is 4 but the index is 7')
+}
+
+Step 'Panico en un hilo con std: mensaje y codigo 101' {
+    $code = Run 'ps2 run -p std-panic --timeout 90' "$out\std-panic.txt" "$out\std-panic.err"
+    $text = Get-Content "$out\std-panic.txt" -Raw
+    Get-Content "$out\std-panic.txt" | ForEach-Object { Write-Host "  $_" }
+    ($code -eq 101) -and ($text -match "thread 'calculo'") -and ($text -match 'index out of bounds: the len is 4 but the index is 7')
+}
+
+Step 'std-hello: hilos + canal + HashMap + archivo + reloj + GS (captura)' {
+    $code = Run "ps2 run -p std-hello --timeout 120 --until `"pantalla lista`" --screenshot `"$out\std-hello.png`"" "$out\std-hello.txt" "$out\std-hello.err"
+    $text = Get-Content "$out\std-hello.txt" -Raw
+    Get-Content "$out\std-hello.txt" | ForEach-Object { Write-Host "  $_" }
+    ($code -eq 0) -and ($text -match '-> 9592') -and ($text -match 'llaves=1') -and ($text -match 'reloj de la consola: 20') -and (Test-Path "$out\std-hello.png")
 }
 
 Step 'hello: consola + texto en pantalla (captura)' {

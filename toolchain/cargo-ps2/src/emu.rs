@@ -60,9 +60,10 @@ fn strip_timestamp(line: &str) -> &str {
     line
 }
 
-/// Mensajes del propio PCSX2 que se intercalan con la consola del EE.
+/// Mensajes del propio PCSX2 y de los módulos de la BIOS en el IOP (FILEIO,
+/// LOADFILE) que se intercalan con la consola del EE. Con `-v` se muestran.
 fn is_emulator_noise(line: &str) -> bool {
-    const PREFIXES: [&str; 13] = [
+    const PREFIXES: [&str; 31] = [
         "Frame rate:",
         "Setting vsync mode:",
         "ELF changed, active CRC",
@@ -76,6 +77,24 @@ fn is_emulator_noise(line: &str) -> bool {
         "DVE powered",
         "Opening GS",
         "Closing GS",
+        "BIOS: Successfully found the instruction pattern",
+        "IOPHLE ",
+        "[Unsafe Settings]",
+        "OSD [",
+        "read/write allocate memory",
+        "open name ",
+        "open fd = ",
+        "dopen name ",
+        "dopen fd = ",
+        "mkdir name ",
+        "rmdir name ",
+        "remove file ",
+        "Unknown device '",
+        "Known devices are ",
+        "loadmodule: ",
+        "RegisterLibraryEntries:",
+        "getstat name ",
+        "cdvdLoadElf()",
     ];
     PREFIXES.iter().any(|p| line.starts_with(p))
 }

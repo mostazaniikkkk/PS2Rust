@@ -33,3 +33,18 @@ version = "0.1.0"
 dependencies = [
  "ps2",
 ]
+
+[[package]]
+name = "std-hello"
+version = "0.1.0"
+dependencies = [
+ "ps2",
+]
+
+[[package]]
+name = "std-panic"
+version = "0.1.0"
+
+[[package]]
+name = "std-selftest"
+version = "0.1.0"

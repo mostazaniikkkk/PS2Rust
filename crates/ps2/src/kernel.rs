@@ -1,5 +1,62 @@
 //! Llamadas al kernel del Emotion Engine y acceso a hardware mapeado en memoria.
 
+core::arch::global_asm!(
+    r#"
+    .set push
+    .set noreorder
+    .set noat
+    .section .text.__ps2_syscall,"ax",@progbits
+    # u32 __ps2_syscall(a0, a1, a2, a3, numero)
+    .globl __ps2_syscall
+    .type __ps2_syscall,@function
+__ps2_syscall:
+    lw    $3, 16($sp)
+    syscall
+    jr    $ra
+    nop
+    .size __ps2_syscall, . - __ps2_syscall
+
+    .section .text.__ps2_write64,"ax",@progbits
+    # void __ps2_write64(addr, lo, hi): una sola escritura de 64 bits (sd).
+    .globl __ps2_write64
+    .type __ps2_write64,@function
+__ps2_write64:
+    .word 0x0005283C                  # dsll32 $5, $5, 0
+    .word 0x0005283E                  # dsrl32 $5, $5, 0   (lo sin extensión de signo)
+    .word 0x0006303C                  # dsll32 $6, $6, 0
+    or    $5, $5, $6
+    .word 0xFC850000                  # sd     $5, 0($4)
+    jr    $ra
+    nop
+    .size __ps2_write64, . - __ps2_write64
+
+    .section .text.__ps2_read64,"ax",@progbits
+    # void __ps2_read64(addr, out: *mut [u32; 2]): una sola lectura de 64 bits (ld).
+    .globl __ps2_read64
+    .type __ps2_read64,@function
+__ps2_read64:
+    .word 0xDC820000                  # ld     $2, 0($4)
+    sw    $2, 0($5)
+    .word 0x0002103F                  # dsra32 $2, $2, 0
+    sw    $2, 4($5)
+    jr    $ra
+    nop
+    .size __ps2_read64, . - __ps2_read64
+
+    .section .text.__ps2_cop0_count,"ax",@progbits
+    # u32 __ps2_cop0_count(): registro Count del COP0 (un tick por ciclo de CPU).
+    .globl __ps2_cop0_count
+    .type __ps2_cop0_count,@function
+__ps2_cop0_count:
+    .word 0x40024800                  # mfc0 $2, $9
+    jr    $ra
+    nop
+    .size __ps2_cop0_count, . - __ps2_cop0_count
+
+    .set pop
+    "#
+);
+
 extern "C" {
     fn __ps2_syscall(a0: u32, a1: u32, a2: u32, a3: u32, number: u32) -> u32;
     fn __ps2_write64(addr: u32, lo: u32, hi: u32);
