@@ -1,0 +1,9 @@
+[package]
+name = "ps2-iop"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+repository = "https://github.com/mostazaniikkkk/PS2Rust"
+description = "Runtime de Rust para módulos IRX del IOP de la PlayStation 2: kernel, heap, consola, hilos y servidor RPC"
+
+[dependencies]

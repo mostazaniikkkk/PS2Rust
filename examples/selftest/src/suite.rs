@@ -12,6 +12,7 @@ use alloc::collections::{BTreeMap, BinaryHeap, VecDeque};
 use alloc::format;
 use alloc::rc::{Rc, Weak};
 use alloc::string::{String, ToString};
+#[cfg(target_has_atomic = "ptr")]
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -19,12 +20,35 @@ use core::cell::RefCell;
 use core::fmt::{self, Write};
 use core::hint::black_box;
 use core::ops::{Add, Mul};
+#[cfg(target_has_atomic = "ptr")]
 use core::sync::atomic::{AtomicBool, AtomicI16, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 /// Lo que depende de la plataforma.
 pub struct Env {
-    /// Raíz cuadrada `f32` nativa (FPU en PS2, `f32::sqrt` en el PC).
+    /// Raíz cuadrada `f32` de la plataforma (FPU en el EE, por software en el
+    /// IOP, `f32::sqrt` en el PC).
     pub sqrt: fn(f32) -> f32,
+    /// Título de la sección de `f32`.
+    pub f32_title: &'static str,
+    /// ¿Hay atómicos y `Arc`? El R3000A del IOP no tiene con qué hacerlos.
+    #[allow(dead_code)]
+    pub atomics: bool,
+    /// Palabras de 32 bits del bloque grande de la prueba del heap.
+    pub big_block_words: usize,
+}
+
+impl Env {
+    /// Emotion Engine: FPU, atómicos y 32 MiB de RAM.
+    #[allow(dead_code)]
+    pub fn ee(sqrt: fn(f32) -> f32) -> Env {
+        Env { sqrt, f32_title: "f32 (FPU del Emotion Engine)", atomics: true, big_block_words: 1 << 20 }
+    }
+
+    /// IOP: sin FPU, sin atómicos y 2 MiB de RAM para todo.
+    #[allow(dead_code)]
+    pub fn iop(sqrt: fn(f32) -> f32) -> Env {
+        Env { sqrt, f32_title: "f32 (por software: el IOP no tiene FPU)", atomics: false, big_block_words: 1 << 15 }
+    }
 }
 
 /// Escritor que codifica como `%XX` todo byte que no sea ASCII "seguro".
@@ -86,8 +110,8 @@ pub fn run(out: &mut dyn Write, env: &Env) -> u32 {
     formatting(&mut t);
     collections(&mut t);
     smart_pointers(&mut t);
-    atomics(&mut t);
-    heap_stress(&mut t);
+    atomics(&mut t, env);
+    heap_stress(&mut t, env);
     strings(&mut t);
     language(&mut t);
     algorithms(&mut t);
@@ -209,7 +233,7 @@ fn soft_f64(t: &mut T) {
 }
 
 fn hard_f32(t: &mut T, env: &Env) {
-    t.section("f32 (FPU del Emotion Engine)");
+    t.section(env.f32_title);
     let a = black_box(1.5f32);
     let b = black_box(2.25f32);
     show!(t, "aritmetica", "{} {} {} {}", a * b + 0.125, a - b, b / a, -a * a);
@@ -394,15 +418,6 @@ fn smart_pointers(t: &mut T) {
     drop(other);
     t.check("weak tras soltar", weak.upgrade().is_none());
 
-    let counter = Arc::new(AtomicU32::new(0));
-    let clones: Vec<Arc<AtomicU32>> = (0..black_box(5)).map(|_| Arc::clone(&counter)).collect();
-    for (i, c) in clones.iter().enumerate() {
-        c.fetch_add(i as u32 + 1, Ordering::SeqCst);
-    }
-    show!(t, "arc", "valor={} fuertes={}", counter.load(Ordering::SeqCst), Arc::strong_count(&counter));
-    drop(clones);
-    t.check("arc::try_unwrap", Arc::try_unwrap(counter).ok().map(|a| a.into_inner()) == Some(15));
-
     let log = RefCell::new(Vec::new());
     {
         let _a = Noisy(&log, 1);
@@ -416,8 +431,24 @@ fn smart_pointers(t: &mut T) {
     show!(t, "box dyn Fn", "{}", callbacks.iter().fold(black_box(6), |acc, f| f(acc)));
 }
 
-fn atomics(t: &mut T) {
-    t.section("atomicos");
+#[cfg(not(target_has_atomic = "ptr"))]
+fn atomics(_t: &mut T, _env: &Env) {}
+
+#[cfg(target_has_atomic = "ptr")]
+fn atomics(t: &mut T, env: &Env) {
+    if !env.atomics {
+        return;
+    }
+    t.section("atomicos y Arc");
+    let counter = Arc::new(AtomicU32::new(0));
+    let clones: Vec<Arc<AtomicU32>> = (0..black_box(5)).map(|_| Arc::clone(&counter)).collect();
+    for (i, c) in clones.iter().enumerate() {
+        c.fetch_add(i as u32 + 1, Ordering::SeqCst);
+    }
+    show!(t, "arc", "valor={} fuertes={}", counter.load(Ordering::SeqCst), Arc::strong_count(&counter));
+    drop(clones);
+    t.check("arc::try_unwrap", Arc::try_unwrap(counter).ok().map(|a| a.into_inner()) == Some(15));
+
     let a = AtomicU32::new(black_box(5));
     let mut spins = 0;
     // Bucle CAS clásico: duplicar hasta pasar de 1000.
@@ -454,7 +485,7 @@ fn atomics(t: &mut T) {
     t.check("atomicptr swap", unsafe { *prev == 1 && *ptr.load(Ordering::SeqCst) == 2 });
 }
 
-fn heap_stress(t: &mut T) {
+fn heap_stress(t: &mut T, env: &Env) {
     t.section("heap");
     let mut rng = XorShift(black_box(0xC0FF_EE00_1234_5678));
     let mut live: Vec<Vec<u8>> = Vec::new();
@@ -481,12 +512,13 @@ fn heap_stress(t: &mut T) {
     t.check("bloques vivos intactos", intact);
     drop(live);
 
-    // Un bloque grande: 4 MiB de u32.
-    let mut big = vec![0u32; black_box(1 << 20)];
+    // Un bloque grande: 4 MiB de u32 en el EE, 128 KiB en el IOP.
+    let mut big = vec![0u32; black_box(env.big_block_words)];
     for (i, x) in big.iter_mut().enumerate() {
         *x = (i as u32).wrapping_mul(2_654_435_761);
     }
-    show!(t, "4 MiB", "{:#010x}", big.iter().fold(0u32, |a, &x| a.rotate_left(1) ^ x));
+    show!(t, "bloque grande", "{} KiB {:#010x}", big.len() * 4 / 1024, big.iter().fold(0u32, |a, &x| a.rotate_left(1) ^ x));
+    drop(big);
 
     #[repr(align(64))]
     struct Aligned([u8; 64]);

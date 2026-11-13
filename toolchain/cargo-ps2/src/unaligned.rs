@@ -338,7 +338,7 @@ fn find_partner(words: &[u32], k: usize, tramp: &Tramp) -> Option<usize> {
     let w = words[k];
     let rt = rt_of(w);
     let mut j = k + 1;
-    while j < words.len() && j <= k + 16 {
+    while j < words.len() && j <= k + 64 {
         let x = words[j];
         if partners(w, x) {
             return Some(j);

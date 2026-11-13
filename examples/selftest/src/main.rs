@@ -20,7 +20,7 @@ fn native_sqrt(x: f32) -> f32 {
 }
 
 fn main() -> i32 {
-    let env = suite::Env { sqrt: native_sqrt };
+    let env = suite::Env::ee(native_sqrt);
     // `Escaped`: transporte sin pérdida por la consola del emulador.
     suite::run(&mut suite::Escaped(Console), &env) as i32
 }

@@ -8,6 +8,8 @@
 
 mod elf;
 mod emu;
+mod irx;
+mod mips1;
 mod r5900;
 mod stdsrc;
 mod unaligned;
@@ -21,21 +23,28 @@ use std::process::{exit, Command, Stdio};
 const TARGET_NAME: &str = "mipsel-sony-ps2";
 const TARGET_JSON: &str = include_str!("../assets/mipsel-sony-ps2.json");
 const LINKER_SCRIPT: &str = include_str!("../assets/ps2.ld");
+const IOP_TARGET_NAME: &str = "mipsel-sony-ps2iop";
+const IOP_TARGET_JSON: &str = include_str!("../assets/mipsel-sony-ps2iop.json");
+const IOP_LINKER_SCRIPT: &str = include_str!("../assets/iop.ld");
 
 const HELP: &str = "\
-cargo ps2 — compilador de Rust para PlayStation 2 (Emotion Engine / R5900),
-con la biblioteca estándar (std) o sin ella (no_std).
+cargo ps2 — compilador de Rust para PlayStation 2: programas para el Emotion
+Engine (R5900), con la biblioteca estándar (std) o sin ella (no_std), y
+módulos IRX para el IOP (R3000A, no_std).
 
 USO:
     cargo ps2 build [opciones] [-- <args extra de cargo>]
     cargo ps2 run   [opciones] [-- <args extra de cargo>]
-    cargo ps2 check <archivo.elf>...
+    cargo ps2 check <archivo.elf | archivo.irx>...
     cargo ps2 legalize <entrada> <salida.elf>
     cargo ps2 target-spec | linker-script
 
 OPCIONES DE build / run:
     -p, --package <nombre>   Paquete a compilar (por defecto, el del directorio actual)
         --bin <nombre>       Binario concreto del paquete
+        --iop                Compila un módulo IRX para el IOP (el procesador de E/S)
+        --verify-relocs      Con --iop: enlaza además el módulo en otra dirección y
+                             comprueba que el IRX, reubicado ahí, queda idéntico
         --debug              Perfil dev en vez de release
         --manifest-path <p>  Cargo.toml a usar
     -v, --verbose            Muestra los comandos y todo el log del emulador
@@ -48,8 +57,10 @@ OPCIONES DE run:
         --log <archivo>      Guarda la salida de la consola del EE
         --keep-open          No cierra el emulador al terminar el programa
 
-`check` verifica que un ELF cualquiera sólo use instrucciones del R5900.
-El ejecutable final queda en target/ps2/<nombre>.elf.
+`check` verifica que un ELF sólo use instrucciones del R5900, o que un IRX
+sólo use las del R3000A. El resultado queda en target/ps2/<nombre>.elf (EE) o
+target/ps2/<nombre>.irx (IOP). Un IRX no se ejecuta solo: lo carga un programa
+del EE (ver examples/iop-demo).
 ";
 
 struct Opts {
@@ -64,6 +75,8 @@ struct Opts {
     screenshot: Option<String>,
     log: Option<String>,
     keep_open: bool,
+    iop: bool,
+    verify_relocs: bool,
     extra: Vec<String>,
 }
 
@@ -90,6 +103,9 @@ fn main() {
         }
         "run" => {
             let o = parse_opts(rest);
+            if o.iop {
+                die("un módulo IRX no se ejecuta solo: compílalo con `build --iop` y cárgalo desde un programa del EE (ver examples/iop-demo)");
+            }
             let elfs = build(&o);
             if elfs.len() != 1 {
                 die(format!("`run` necesita exactamente un binario y hay {}: usa -p/--bin", elfs.len()));
@@ -104,6 +120,13 @@ fn main() {
             let mut bad = false;
             for f in rest {
                 let mut bytes = fs::read(f).unwrap_or_else(|e| die(format!("no pude leer {f}: {e}")));
+                if bytes.len() > 18 && bytes[16..18] == [0x80, 0xff] {
+                    match check_irx(f, &bytes) {
+                        Some(n) => println!("{f}: OK — {n} instrucciones, todas válidas para el R3000A del IOP"),
+                        None => bad = true,
+                    }
+                    continue;
+                }
                 match process_elf(&mut bytes, false) {
                     Ok(rep) => {
                         if rep.errors.is_empty() {
@@ -147,6 +170,8 @@ fn parse_opts(args: &[String]) -> Opts {
         screenshot: None,
         log: None,
         keep_open: false,
+        iop: false,
+        verify_relocs: false,
         extra: Vec::new(),
     };
     let mut it = args.iter();
@@ -167,11 +192,16 @@ fn parse_opts(args: &[String]) -> Opts {
             "--screenshot" => o.screenshot = Some(val(a)),
             "--log" => o.log = Some(val(a)),
             "--keep-open" => o.keep_open = true,
+            "--iop" => o.iop = true,
+            "--verify-relocs" => o.verify_relocs = true,
             "--" => {
                 o.extra.extend(it.by_ref().cloned());
             }
             other => die(format!("opción desconocida `{other}`")),
         }
+    }
+    if o.verify_relocs && !o.iop {
+        die("--verify-relocs sólo tiene sentido con --iop");
     }
     o
 }
@@ -222,23 +252,62 @@ fn json_string_field(json: &str, field: &str) -> Option<String> {
     None
 }
 
-/// Compila, enlaza, legaliza y verifica. Devuelve los `.elf` finales.
+/// Dirección de carga alternativa para `--verify-relocs`.
+const VERIFY_BASE: u32 = 0x000a_4510;
+
+/// Compila, enlaza, legaliza y verifica. Devuelve los `.elf` (o `.irx`) finales.
 fn build(o: &Opts) -> Vec<PathBuf> {
+    let outputs = build_at(o, None);
+    if o.verify_relocs {
+        // El enlazador hace de referencia: el mismo módulo enlazado en otra
+        // dirección debe coincidir con el IRX reubicado ahí como lo haría el
+        // cargador de la BIOS.
+        build_at(o, Some(VERIFY_BASE));
+        for irx_path in &outputs {
+            let elf_path = irx_path.with_extension("rebased.elf");
+            let read = |p: &Path| fs::read(p).unwrap_or_else(|e| die(format!("no pude leer {}: {e}", p.display())));
+            match irx::verify_relocation(&read(irx_path), &read(&elf_path), VERIFY_BASE) {
+                Ok(words) => eprintln!(
+                    "      reubicación verificada: cargado en {VERIFY_BASE:#x}, las {words} palabras coinciden con las del enlazador"
+                ),
+                Err(e) => die(format!("{}: {e}", irx_path.display())),
+            }
+            let _ = fs::remove_file(&elf_path);
+        }
+    }
+    outputs
+}
+
+fn build_at(o: &Opts, iop_base: Option<u32>) -> Vec<PathBuf> {
     let target = target_dir(o);
     let support = target.join("ps2-toolchain");
     let out_dir = target.join("ps2");
     fs::create_dir_all(&support).unwrap_or_else(|e| die(format!("no pude crear {}: {e}", support.display())));
     fs::create_dir_all(&out_dir).unwrap_or_else(|e| die(format!("no pude crear {}: {e}", out_dir.display())));
-    let spec = support.join(format!("{TARGET_NAME}.json"));
+    let (target_name, target_json, linker_script) =
+        if o.iop { (IOP_TARGET_NAME, IOP_TARGET_JSON, IOP_LINKER_SCRIPT) } else { (TARGET_NAME, TARGET_JSON, LINKER_SCRIPT) };
+    // Con `iop_base` (sólo para comprobar el conversor) el módulo del IOP se
+    // enlaza en esa dirección y el ELF se deja sin convertir.
+    let rebased;
+    let linker_script = match &iop_base {
+        Some(base) => {
+            rebased = linker_script.replacen(". = 0;", &format!(". = {base:#x};"), 1);
+            rebased.as_str()
+        }
+        None => linker_script,
+    };
+    let spec = support.join(format!("{target_name}.json"));
     // El nombre lleva un hash del contenido: si el script cambia, cambian los
     // argumentos del enlazador y Cargo vuelve a enlazar.
-    let script = support.join(format!("ps2-{:016x}.ld", fnv1a(LINKER_SCRIPT.as_bytes())));
-    write_if_changed(&spec, TARGET_JSON);
-    write_if_changed(&script, LINKER_SCRIPT);
+    let script = support.join(format!("{}-{:016x}.ld", if o.iop { "iop" } else { "ps2" }, fnv1a(linker_script.as_bytes())));
+    write_if_changed(&spec, target_json);
+    write_if_changed(&script, linker_script);
 
     let script_arg = script.to_string_lossy().replace('\\', "/");
+    // Los módulos del IOP conservan las relocaciones: el IRX es reubicable.
+    let extra_link = if o.iop { ", '-Clink-arg=--emit-relocs'" } else { "" };
     let rustflags = format!(
-        "target.{TARGET_NAME}.rustflags=['-Clink-arg=-T{script_arg}', '-Clink-arg=--gc-sections', '-Clink-arg=-znorelro']"
+        "target.{target_name}.rustflags=['-Clink-arg=-T{script_arg}', '-Clink-arg=--gc-sections', '-Clink-arg=-znorelro'{extra_link}]"
     );
 
     let library = stdsrc::prepare(&support).unwrap_or_else(|e| die(e));
@@ -250,7 +319,9 @@ fn build(o: &Opts) -> Vec<PathBuf> {
     }
     // std (con la plataforma PS2), core, alloc y panic_abort, desde la copia
     // parcheada de rust-src.
-    c.args(["-Zbuild-std=std,panic_abort", "-Zbuild-std-features=compiler-builtins-mem"]);
+    // En el IOP (2 MiB de RAM) no hay std: sólo core y alloc.
+    let build_std = if o.iop { "-Zbuild-std=core,alloc" } else { "-Zbuild-std=std,panic_abort" };
+    c.args([build_std, "-Zbuild-std-features=compiler-builtins-mem"]);
     c.env("__CARGO_TESTS_ONLY_SRC_ROOT", &library);
     c.arg("-Zjson-target-spec");
     c.arg("--target").arg(&spec);
@@ -293,11 +364,63 @@ fn build(o: &Opts) -> Vec<PathBuf> {
     let mut elfs = Vec::new();
     for exe in executables {
         let name = exe.file_name().unwrap().to_string_lossy().into_owned();
+        if iop_base.is_some() {
+            let out = out_dir.join(format!("{name}.rebased.elf"));
+            fs::copy(&exe, &out).unwrap_or_else(|e| die(format!("no pude copiar {}: {e}", exe.display())));
+            elfs.push(out);
+            continue;
+        }
+        if o.iop {
+            let out = out_dir.join(format!("{name}.irx"));
+            make_irx(&exe, &out);
+            elfs.push(out);
+            continue;
+        }
         let out = out_dir.join(format!("{name}.elf"));
         legalize_file(&exe, &out);
         elfs.push(out);
     }
     elfs
+}
+
+/// Convierte el ELF enlazado a IRX, lo verifica para el R3000A y lo escribe.
+fn make_irx(input: &Path, output: &Path) {
+    let elf = fs::read(input).unwrap_or_else(|e| die(format!("no pude leer {}: {e}", input.display())));
+    let irx = irx::convert(&elf).unwrap_or_else(|e| die(format!("{}: {e}", input.display())));
+    let scanned = check_irx(&output.display().to_string(), &irx.bytes).unwrap_or_else(|| exit(1));
+    fs::write(output, &irx.bytes).unwrap_or_else(|e| die(format!("no pude escribir {}: {e}", output.display())));
+    let imports: Vec<String> = irx.imports.iter().map(|(n, c)| format!("{n}({c})")).collect();
+    let helpers = if irx.helpers > 0 { format!(" ({} con entrada auxiliar)", irx.helpers) } else { String::new() };
+    eprintln!(
+        "      IOP: módulo {:?} v{}.{} — texto {} B, datos {} B, bss {} B, {} relocaciones{helpers}",
+        irx.name, irx.version.0, irx.version.1, irx.text_size, irx.data_size, irx.bss_size, irx.relocs
+    );
+    let hilo = if irx.hilo_fixes > 0 { format!(", {} mult/div alejados de mfhi/mflo", irx.hilo_fixes) } else { String::new() };
+    eprintln!("    R3000: {scanned} instrucciones verificadas (MIPS I){hilo}; importa {}", imports.join(", "));
+    eprintln!("      IRX: {} ({} bytes)", output.display(), irx.bytes.len());
+}
+
+/// Verifica el código de un IRX. Devuelve las instrucciones revisadas, o
+/// `None` (tras imprimir los errores) si hay alguna inválida.
+fn check_irx(name: &str, bytes: &[u8]) -> Option<usize> {
+    let ranges = irx::code_ranges(bytes).unwrap_or_else(|e| die(format!("{name}: {e}")));
+    let mut rep = mips1::Report { scanned: 0, errors: Vec::new() };
+    for (offset, size) in ranges {
+        let part = mips1::check(&bytes[offset..offset + size], 0);
+        rep.scanned += part.scanned;
+        rep.errors.extend(part.errors);
+    }
+    if rep.errors.is_empty() {
+        return Some(rep.scanned);
+    }
+    eprintln!("{name}: {} instrucciones incompatibles con el R3000A del IOP:", rep.errors.len());
+    for (addr, word, msg) in rep.errors.iter().take(40) {
+        eprintln!("  {addr:#010x}: {word:08x}  {msg}");
+    }
+    if rep.errors.len() > 40 {
+        eprintln!("  … y {} más", rep.errors.len() - 40);
+    }
+    None
 }
 
 fn fnv1a(data: &[u8]) -> u64 {

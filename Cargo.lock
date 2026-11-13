@@ -17,6 +17,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "iop-demo"
+version = "0.1.0"
+dependencies = [
+ "ps2",
+]
+
+[[package]]
+name = "iop-selftest"
+version = "0.1.0"
+dependencies = [
+ "ps2-iop",
+]
+
+[[package]]
+name = "iop-selftest-runner"
+version = "0.1.0"
+
+[[package]]
 name = "panic-demo"
 version = "0.1.0"
 dependencies = [
@@ -26,6 +44,17 @@ dependencies = [
 [[package]]
 name = "ps2"
 version = "0.1.0"
+
+[[package]]
+name = "ps2-iop"
+version = "0.1.0"
+
+[[package]]
+name = "rustiop"
+version = "0.1.0"
+dependencies = [
+ "ps2-iop",
+]
 
 [[package]]
 name = "selftest"

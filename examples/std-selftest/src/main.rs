@@ -24,7 +24,7 @@ impl std::fmt::Write for Out {
 }
 
 fn main() {
-    let env = suite::Env { sqrt: f32::sqrt };
+    let env = suite::Env::ee(f32::sqrt);
     let mut core_out = Out(String::new());
     let core_failed = suite::run(&mut core_out, &env);
     let (std_out, std_failed) = std_suite::run();

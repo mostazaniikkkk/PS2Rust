@@ -1,4 +1,4 @@
-# Verificación completa del compilador de Rust para PlayStation 2.
+# Verificación completa del compilador de Rust para PlayStation 2 (EE e IOP).
 #
 #   powershell -ExecutionPolicy Bypass -File verify.ps1 -Emulator C:\PCSX2\pcsx2-qt.exe
 #
@@ -53,9 +53,10 @@ Step 'Pruebas unitarias del legalizador R5900' {
     $code -eq 0
 }
 
-$examples = 'hello', 'selftest', 'cube', 'panic-demo', 'std-hello', 'std-selftest', 'std-panic'
+$examples = 'hello', 'selftest', 'cube', 'panic-demo', 'std-hello', 'std-selftest', 'std-panic', 'iop-demo', 'iop-selftest-runner'
+$modules = 'rustiop', 'iop-selftest'
 
-Step 'Compilar los siete ejemplos para PS2 (cuatro sin std, tres con std)' {
+Step 'Compilar los nueve programas del EE (cuatro sin std, cinco con std)' {
     $ok = $true
     foreach ($p in $examples) {
         $code = Run "ps2 build -p $p" "$out\build-$p.txt" "$out\build-$p.err"
@@ -65,9 +66,20 @@ Step 'Compilar los siete ejemplos para PS2 (cuatro sin std, tres con std)' {
     $ok
 }
 
-Step 'El verificador rechaza el ELF sin legalizar y acepta el legalizado' {
+Step 'IOP: compilar los dos modulos IRX; reubicados como la BIOS, identicos al enlazador' {
+    $ok = $true
+    foreach ($p in $modules) {
+        $code = Run "ps2 build --iop --verify-relocs -p $p" "$out\build-$p.txt" "$out\build-$p.err"
+        $log = @(Get-Content "$out\build-$p.err" -Encoding UTF8)
+        $log | Select-String 'IOP:|R3000:|verificada' | ForEach-Object { Write-Host "  $p`: $($_.Line.Trim())" }
+        if (($code -ne 0) -or -not ($log -match 'verificada: cargado en')) { $ok = $false; $log | Select-Object -Last 15 | Write-Host }
+    }
+    $ok
+}
+
+Step 'El verificador rechaza el ELF sin legalizar y acepta los legalizados y los IRX' {
     $raw = Run 'ps2 check target\mipsel-sony-ps2\release\selftest' "$out\check-raw.txt" "$out\check-raw.err"
-    $elfs = ($examples | ForEach-Object { "target\ps2\$_.elf" }) -join ' '
+    $elfs = (@($examples | ForEach-Object { "target\ps2\$_.elf" }) + @($modules | ForEach-Object { "target\ps2\$_.irx" })) -join ' '
     $fixed = Run "ps2 check $elfs" "$out\check-ok.txt" "$out\check-ok.err"
     Get-Content "$out\check-raw.err" | Select-Object -First 1 | ForEach-Object { Write-Host "  $_" }
     Get-Content "$out\check-ok.txt" | ForEach-Object { Write-Host "  $_" }
@@ -90,6 +102,21 @@ Step 'Bateria std (hilos, sync, tiempo, archivos, entorno): PS2 identica al PC' 
     $same = SameOutput "$out\std-selftest.expected.txt" "$out\std-selftest.actual.txt"
     Write-Host "  exit PC $hostCode, PS2 $ps2Code"
     ($hostCode -eq 0) -and ($ps2Code -eq 0) -and $same -and -not (Test-Path "$out\std_selftest_tmp")
+}
+
+Step 'IOP: bateria core/alloc en el R3000A: salida del IOP identica a la del PC' {
+    $hostCode = Run 'run --release -q --manifest-path toolchain\selftest-host\Cargo.toml -- --iop' "$out\iop-selftest.expected.txt" "$out\iop-selftest-host.err"
+    $ps2Code = Run "ps2 run -p iop-selftest-runner --timeout 240 --log `"$out\iop-selftest.actual.txt`"" "$out\iop-selftest.stdout.txt" "$out\iop-selftest.err"
+    $same = SameOutput "$out\iop-selftest.expected.txt" "$out\iop-selftest.actual.txt"
+    Write-Host "  exit PC $hostCode, PS2 $ps2Code"
+    ($hostCode -eq 0) -and ($ps2Code -eq 0) -and $same
+}
+
+Step 'IOP: modulo en Rust sirviendo RPC a un programa del EE (captura)' {
+    $code = Run "ps2 run -p iop-demo --timeout 120 --until `"pantalla lista`" --screenshot `"$out\iop-demo.png`"" "$out\iop-demo.txt" "$out\iop-demo.err"
+    $text = Get-Content "$out\iop-demo.txt" -Raw
+    Get-Content "$out\iop-demo.txt" | ForEach-Object { Write-Host "  $_" }
+    ($code -eq 0) -and ($text -match 'rustiop: Rust en el IOP') -and ($text -match 'strlen = 7') -and ($text -match 'demo IOP: 7/7 comprobaciones correctas') -and (Test-Path "$out\iop-demo.png")
 }
 
 Step 'Panico: mensaje por consola y codigo de salida 101' {

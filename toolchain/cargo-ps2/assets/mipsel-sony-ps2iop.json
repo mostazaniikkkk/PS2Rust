@@ -1,0 +1,31 @@
+{
+  "arch": "mips",
+  "atomic-cas": false,
+  "cpu": "mips1",
+  "data-layout": "e-m:m-p:32:32-i8:8:32-i16:16:32-i64:64-n32-S64",
+  "eh-frame-header": false,
+  "emit-debug-gdb-scripts": false,
+  "env": "ps2iop",
+  "exe-suffix": "",
+  "executables": true,
+  "features": "+mips1,+soft-float,+noabicalls",
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-abiname": "o32",
+  "llvm-args": [
+    "-mno-check-zero-division"
+  ],
+  "llvm-target": "mipsel-sony-ps2iop",
+  "max-atomic-width": 0,
+  "metadata": {
+    "description": "MIPS R3000A (LE) Sony PlayStation 2 - I/O Processor, IRX modules",
+    "host_tools": false,
+    "std": false,
+    "tier": 3
+  },
+  "os": "none",
+  "panic-strategy": "abort",
+  "relocation-model": "static",
+  "target-pointer-width": 32,
+  "vendor": "sony"
+}

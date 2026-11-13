@@ -5,6 +5,9 @@ para el Emotion Engine (MIPS R5900) de la PlayStation 2. No usa C ni PS2SDK:
 el arranque, el kernel, la comunicación con el procesador de E/S, los hilos,
 los archivos y los gráficos están escritos en Rust.
 
+También compila **módulos IRX para el IOP** (el procesador de E/S, un MIPS
+R3000A con 2 MiB de RAM), sin std: ver [Rust en el IOP](#rust-en-el-iop).
+
 | [`std-hello`](examples/std-hello/src/main.rs) | [`cube`](examples/cube/src/main.rs) | [`hello`](examples/hello/src/main.rs) |
 |---|---|---|
 | ![Hilos, archivos y reloj con la std](docs/std-hello.png) | ![Cubo con sombreado Gouraud](docs/cube.png) | ![Texto en pantalla](docs/hello.png) |
@@ -109,6 +112,75 @@ entre las dos mitades hay otras instrucciones, se reagrupan cuando se puede
 demostrar que es seguro (no tocan el registro ni la base, y ninguna es destino
 de un salto, contando las tablas de saltos de los datos).
 
+## Rust en el IOP
+
+La PS2 tiene un segundo procesador, el IOP: un R3000A (MIPS I, el de la
+PlayStation original) con 2 MiB de RAM que se ocupa de los mandos, el sonido,
+el disco y la red. Sus programas son módulos `.irx` que la BIOS carga y enlaza
+con el kernel. `cargo ps2 build --iop` los compila desde Rust (`no_std` +
+`alloc`), con el crate [`ps2-iop`](crates/ps2-iop/src/lib.rs) como runtime:
+
+```rust
+#![no_std]
+#![no_main]
+use ps2_iop::{println, rpc};
+
+ps2_iop::module!(name: "doble", version: (1, 0), main: main);
+
+fn main() {
+    println!("hola desde Rust en el IOP");
+    // Servidor RPC: un programa del EE lo llama con SifRpcClient.
+    rpc::serve(0x1234_5678, 64, |_function, data, _received| {
+        let n = u32::from_le_bytes(data[..4].try_into().unwrap());
+        data[..4].copy_from_slice(&(n * 2).to_le_bytes());
+    });
+}
+```
+
+![Un programa del EE llamando por RPC a un módulo del IOP, los dos en Rust](docs/iop-demo.png)
+
+En la captura, [`iop-demo`](examples/iop-demo/src/main.rs) (EE, con std) carga
+[`rustiop.irx`](examples/iop-module/src/main.rs) en el IOP y le pide por RPC
+dar la vuelta a un texto UTF-8, cribar primos, ordenar, un CRC-32 y una media
+en `f64`; cada respuesta se compara con el mismo cálculo hecho en el EE.
+Mientras, un segundo hilo del módulo cuenta tics.
+
+| Módulo de `ps2-iop` | Qué ofrece |
+|---|---|
+| `module!` | Identidad del módulo, punto de entrada y `main` en su propio hilo |
+| `print!` / `println!` | Consola del IOP |
+| `heap` | Asignador global (`Box`, `Vec`, `String`, `BTreeMap`…) sobre un bloque pedido al kernel |
+| `thread` | Hilos del kernel, expulsivos y con prioridades: `spawn`, `Builder`, `sleep_ms` |
+| `sync` | `Mutex` y `Semaphore` (semáforos del kernel) |
+| `rpc` | `serve`: servidor RPC para los programas del EE |
+| `time`, `math` | Reloj del sistema; `sqrt` en `f32` sin FPU |
+| `kernel` | Las funciones importadas de la BIOS (`thbase`, `thsemap`, `sysmem`, `intrman`, `sifcmd`, `stdio`) y `critical` |
+
+Cómo se llega del código de Rust a un `.irx`:
+
+1. **Target `mipsel-sony-ps2iop`**: MIPS I, coma flotante por software, sin
+   atómicos (el R3000A no tiene `ll`/`sc`), sólo `core` y `alloc`.
+2. **Importaciones.** En el IOP no hay syscalls: cada función del kernel se
+   declara en una tabla dentro del código, con un hueco de dos instrucciones
+   que el cargador sustituye por un salto. Las genera una macro de `ps2-iop`.
+3. **Conversión a IRX.** El módulo se enlaza en la dirección 0 conservando las
+   relocaciones y `cargo-ps2` lo convierte al formato de Sony (ELF de tipo
+   `0xFF80`, sección `.iopmod`, relocaciones relativas a la base de carga).
+4. **El cargador de la BIOS ignora un `R_MIPS_LO16` que no vaya justo detrás
+   de un `R_MIPS_HI16`.** Los compiladores de C emiten siempre la pareja, pero
+   LLVM reutiliza un `lui` para varios accesos; sin corregirlo, el módulo carga
+   y luego lee y escribe en direcciones equivocadas. El conversor empareja cada
+   entrada con palabras auxiliares (detalles en
+   [irx.rs](toolchain/cargo-ps2/src/irx.rs)).
+5. **HI/LO.** MIPS I pide dos instrucciones entre `mfhi`/`mflo` y el siguiente
+   `mult`/`div`; LLVM no las pone. `cargo-ps2` desvía esas secuencias a
+   trampolines que guardan la distancia.
+6. **Verificación.** Todo IRX se revisa instrucción a instrucción: sólo MIPS I,
+   sin FPU, respetando el retardo de carga y la regla de HI/LO. Con
+   `--verify-relocs` además se enlaza el módulo en otra dirección y se comprueba
+   que el IRX, reubicado ahí con las reglas del cargador, queda idéntico
+   palabra por palabra.
+
 ## Requisitos
 
 - Rust estable con el componente `rust-src` (`rustup component add rust-src`).
@@ -132,11 +204,17 @@ cargo ps2 run -p std-hello         # compila y ejecuta en PCSX2, mostrando la co
 cargo ps2 build -p cube            # compila -> target/ps2/cube.elf
 cargo ps2 run -p cube --until "240 frames" --screenshot cube.png
 cargo ps2 check juego.elf          # ¿este ELF sólo usa instrucciones del R5900?
+cargo ps2 build --iop -p rustiop   # módulo del IOP -> target/ps2/rustiop.irx
+cargo ps2 run -p iop-demo          # el programa del EE que lo carga y lo llama
+cargo ps2 check modulo.irx         # ¿este IRX sólo usa instrucciones del R3000A?
 cargo ps2 help
 ```
 
 Compila los paquetes de uno en uno (`-p`): los ejemplos sin std y con std usan
-el crate `ps2` con features distintas.
+el crate `ps2` con features distintas, y los módulos del IOP son otro target.
+Un programa del EE carga un módulo con `std::os::ps2::load_iop_module`; en
+PCSX2, `host:` es el directorio del ELF (`target/ps2`), donde también quedan
+los `.irx`.
 
 Para usarlo en un proyecto propio, fuera de este repositorio:
 
@@ -153,6 +231,9 @@ ps2 = { git = "https://github.com/mostazaniikkkk/PS2Rust", default-features = fa
 [profile.release]
 panic = "abort"
 ```
+
+Para un módulo del IOP, la dependencia es
+`ps2-iop = { git = "https://github.com/mostazaniikkkk/PS2Rust" }`.
 
 El `.elf` resultante se puede cargar en PCSX2 (Sistema → Ejecutar ELF) o en una
 consola con un lanzador de homebrew.
@@ -178,6 +259,8 @@ defecto) añade el arranque, el asignador, el manejador de pánicos y
 - [std-selftest](examples/std-selftest/src/std_suite.rs): batería de la std (25 comprobaciones, más las 33 de `core`/`alloc`).
 - [std-panic](examples/std-panic/src/main.rs): pánico en un hilo con nombre.
 - [hello](examples/hello/src/main.rs), [cube](examples/cube/src/main.rs), [selftest](examples/selftest/src/suite.rs), [panic](examples/panic/src/main.rs): los mismos temas sin std (`#![no_std]`).
+- [iop-module](examples/iop-module/src/main.rs) (`rustiop.irx`) e [iop-demo](examples/iop-demo/src/main.rs): un módulo del IOP con servidor RPC y dos hilos, y el programa del EE que lo usa.
+- [iop-selftest](examples/iop-selftest/src/main.rs) e [iop-selftest-runner](examples/iop-selftest-runner/src/main.rs): la batería de `core`/`alloc` corriendo en el IOP, lanzada desde el EE.
 
 ## Verificación
 
@@ -185,10 +268,11 @@ defecto) añade el arranque, el asignador, el manejador de pánicos y
 powershell -ExecutionPolicy Bypass -File verify.ps1 -Emulator C:\ruta\pcsx2-qt.exe
 ```
 
-El script compila los siete ejemplos, los ejecuta en PCSX2 y comprueba los
-resultados (10 pasos). Las pruebas principales son diferenciales: las baterías
-se compilan tal cual para el PC y para la PS2, y las dos salidas deben
-coincidir byte a byte (212 líneas con la std). Cubren enteros de 32/64/128
+El script compila los nueve programas del EE y los dos módulos del IOP, los
+ejecuta en PCSX2 y comprueba los resultados (13 pasos). Las pruebas principales
+son diferenciales: las baterías se compilan tal cual para el PC y para la PS2,
+y las dos salidas deben coincidir byte a byte (212 líneas con la std en el EE;
+131 en el IOP, donde la misma batería corre sin FPU ni atómicos). Cubren enteros de 32/64/128
 bits, `f64` por software, `f32` en la FPU, formato, colecciones, `Rc`/`Arc`,
 atómicos, el heap, UTF-8, hilos, `Mutex`/`Condvar`/`RwLock`/`Barrier`,
 canales, `thread_local!`, `sleep`, `SystemTime`, archivos (incluidos nombres
@@ -215,6 +299,14 @@ de 1 a 16 caracteres) y el entorno.
   PC, así que `modified()` puede desfasarse unas horas.
 - **Sin `std::net`, `std::process::Command` ni `stdin`.** El mando y el sonido
   tampoco están: viven en el IOP y necesitan sus propios módulos.
+- **IOP: sin std, sin atómicos y sin FPU.** Sólo `core` y `alloc`; no hay
+  `Arc` ni `core::sync::atomic` (para compartir datos entre hilos están
+  `ps2_iop::sync::Mutex` y `kernel::critical`), y `f32`/`f64` van por software.
+  Un pánico imprime el mensaje y deja dormido el hilo: el módulo no se descarga.
+  `ps2-iop` cubre hilos, semáforos, memoria, consola y RPC; para otros servicios
+  del kernel (interrupciones, DMA, dispositivos) hay que declarar sus tablas de
+  importación con la misma macro. El comportamiento del cargador se ha medido
+  con la BIOS real dentro de PCSX2, no en una consola.
 - PCSX2 decodifica la consola del EE como Shift-JIS: el texto no ASCII, `\` y
   `~` se pierden en su log (no en pantalla; `gs::text` dibuja `ñ`, `¡` y `¿`).
 
