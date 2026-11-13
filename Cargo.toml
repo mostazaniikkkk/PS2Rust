@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ps2", "examples/hello", "examples/selftest", "examples/cube", "examples/panic", "examples/std-hello", "examples/std-selftest", "examples/std-panic", "crates/ps2-iop", "examples/iop-module", "examples/iop-demo", "examples/iop-selftest", "examples/iop-selftest-runner"]
+members = ["crates/ps2", "examples/hello", "examples/selftest", "examples/cube", "examples/panic", "examples/std-hello", "examples/std-selftest", "examples/std-panic", "crates/ps2-iop", "examples/iop-module", "examples/iop-demo", "examples/iop-selftest", "examples/iop-selftest-runner", "crates/ps2-gles", "examples/gles-selftest", "examples/gles-demo"]
 exclude = ["toolchain"]
 
 [profile.release]

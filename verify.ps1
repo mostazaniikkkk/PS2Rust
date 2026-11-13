@@ -53,10 +53,16 @@ Step 'Pruebas unitarias del legalizador R5900' {
     $code -eq 0
 }
 
-$examples = 'hello', 'selftest', 'cube', 'panic-demo', 'std-hello', 'std-selftest', 'std-panic', 'iop-demo', 'iop-selftest-runner'
+Step 'Pruebas unitarias de ps2-gles en el PC (nucleo de GL y rasterizador de referencia)' {
+    $code = Run 'test --release -p ps2-gles' "$out\gles-unit.txt" "$out\gles-unit.err"
+    Get-Content "$out\gles-unit.txt" | Select-String 'test result' | Select-Object -First 1 | ForEach-Object { Write-Host "  $_" }
+    $code -eq 0
+}
+
+$examples = 'hello', 'selftest', 'cube', 'panic-demo', 'std-hello', 'std-selftest', 'std-panic', 'iop-demo', 'iop-selftest-runner', 'gles-selftest', 'gles-demo'
 $modules = 'rustiop', 'iop-selftest'
 
-Step 'Compilar los nueve programas del EE (cuatro sin std, cinco con std)' {
+Step 'Compilar los once programas del EE (seis sin std, cinco con std)' {
     $ok = $true
     foreach ($p in $examples) {
         $code = Run "ps2 build -p $p" "$out\build-$p.txt" "$out\build-$p.err"
@@ -117,6 +123,21 @@ Step 'IOP: modulo en Rust sirviendo RPC a un programa del EE (captura)' {
     $text = Get-Content "$out\iop-demo.txt" -Raw
     Get-Content "$out\iop-demo.txt" | ForEach-Object { Write-Host "  $_" }
     ($code -eq 0) -and ($text -match 'rustiop: Rust en el IOP') -and ($text -match 'strlen = 7') -and ($text -match 'demo IOP: 7/7 comprobaciones correctas') -and (Test-Path "$out\iop-demo.png")
+}
+
+Step 'OpenGL ES 1.0: bateria de pixeles en el GS identica a la referencia del PC' {
+    $hostCode = Run 'run --release -q --manifest-path toolchain\selftest-host\Cargo.toml -- --gles' "$out\gles-selftest.expected.txt" "$out\gles-selftest-host.err"
+    $ps2Code = Run "ps2 run -p gles-selftest --timeout 240 --log `"$out\gles-selftest.actual.txt`"" "$out\gles-selftest.stdout.txt" "$out\gles-selftest.err"
+    $same = SameOutput "$out\gles-selftest.expected.txt" "$out\gles-selftest.actual.txt"
+    Write-Host "  exit PC $hostCode, PS2 $ps2Code"
+    ($hostCode -eq 0) -and ($ps2Code -eq 0) -and $same
+}
+
+Step 'OpenGL ES 1.0: demo con texturas, luces, niebla y mezcla (captura)' {
+    $code = Run "ps2 run -p gles-demo --timeout 120 --until `"frames en`" --screenshot `"$out\gles-demo.png`"" "$out\gles-demo.txt" "$out\gles-demo.err"
+    $text = Get-Content "$out\gles-demo.txt" -Raw
+    Get-Content "$out\gles-demo.txt" | ForEach-Object { Write-Host "  $_" }
+    ($code -eq 0) -and ($text -match 'OpenGL ES-CM 1\.0') -and ($text -match '300 frames en \d+ ms, glGetError\(\) = 0x0') -and (Test-Path "$out\gles-demo.png")
 }
 
 Step 'Panico: mensaje por consola y codigo de salida 101' {

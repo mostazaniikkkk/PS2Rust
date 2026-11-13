@@ -369,3 +369,139 @@ impl Gs {
         }
     }
 }
+
+// Lectura del GS hacia el EE: pasa por el VIF1 (canal 1 de DMA).
+const GS_BUSDIR: u32 = 0x1200_1040;
+const VIF1_STAT: u32 = 0x1000_3C00;
+const D1_CHCR: u32 = 0x1000_9000;
+const D1_MADR: u32 = 0x1000_9010;
+const D1_QWC: u32 = 0x1000_9020;
+
+const REG_BITBLTBUF: u64 = 0x50;
+const REG_TRXPOS: u64 = 0x51;
+const REG_TRXREG: u64 = 0x52;
+const REG_TRXDIR: u64 = 0x53;
+
+/// Acceso de bajo nivel, para construir otras bibliotecas gráficas encima
+/// (por ejemplo `ps2-gles`). Los píxeles son siempre de 32 bits (R, G, B, A).
+impl Gs {
+    /// Escribe un registro general del GS (dirección A+D) en el paquete actual.
+    pub fn register(&mut self, address: u8, value: u64) {
+        self.push(address as u64, value);
+    }
+
+    /// Página de memoria (8 KiB) donde empieza el framebuffer en el que se
+    /// dibuja ahora.
+    pub fn draw_page(&self) -> u32 {
+        self.fbp[self.draw]
+    }
+
+    /// Primera página libre detrás de los dos framebuffers. La memoria del GS
+    /// tiene 512 páginas (4 MiB).
+    pub fn first_free_page(&self) -> u32 {
+        self.fbp[1] * 2
+    }
+
+    /// Copia píxeles a la memoria del GS: un rectángulo de `w`×`h` en
+    /// (`x`, `y`) del búfer que empieza en el bloque `block` (256 bytes) y
+    /// tiene `buffer_width` píxeles de ancho (múltiplo de 64).
+    pub fn upload(&mut self, block: u32, buffer_width: u32, x: u32, y: u32, w: u32, h: u32, pixels: &[u8]) {
+        assert!(pixels.len() >= (w * h * 4) as usize, "faltan píxeles");
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.flush();
+        let rows_per_chunk = (((PACKET_QWORDS - 8) * 16) as u32 / (w * 4)).max(1);
+        let mut row = 0;
+        while row < h {
+            let rows = rows_per_chunk.min(h - row);
+            let bytes = (rows * w * 4) as usize;
+            let qwords = (bytes + 15) / 16;
+            let start = (row * w * 4) as usize;
+            unsafe {
+                let b = self.buf;
+                // Cuatro registros A+D que describen la transferencia…
+                b.write_volatile(4 | 1 << 60);
+                b.add(1).write_volatile(0xE);
+                let regs = [
+                    (REG_BITBLTBUF, (block as u64) << 32 | ((buffer_width / 64) as u64) << 48),
+                    (REG_TRXPOS, (x as u64) << 32 | ((y + row) as u64) << 48),
+                    (REG_TRXREG, w as u64 | (rows as u64) << 32),
+                    (REG_TRXDIR, 0),
+                ];
+                for (i, (reg, value)) in regs.iter().enumerate() {
+                    b.add(2 + 2 * i).write_volatile(*value);
+                    b.add(3 + 2 * i).write_volatile(*reg);
+                }
+                // …y los datos, en modo IMAGE.
+                b.add(10).write_volatile(qwords as u64 | 1 << 15 | 2 << 58);
+                b.add(11).write_volatile(0);
+                let data = b.add(12) as *mut u8;
+                core::ptr::copy_nonoverlapping(pixels.as_ptr().add(start), data, bytes);
+                core::ptr::write_bytes(data.add(bytes), 0, qwords * 16 - bytes);
+                self.send(6 + qwords);
+            }
+            row += rows;
+        }
+    }
+
+    /// Lee píxeles de la memoria del GS: el rectángulo de `w`×`h` en
+    /// (`x`, `y`) del búfer que empieza en el bloque `block` y tiene
+    /// `buffer_width` píxeles de ancho.
+    pub fn download(&mut self, block: u32, buffer_width: u32, x: u32, y: u32, w: u32, h: u32, pixels: &mut [u8]) {
+        assert!(pixels.len() >= (w * h * 4) as usize, "no caben los píxeles");
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.flush();
+        // El GS entrega palabras de 128 bits (4 píxeles): se lee un ancho
+        // múltiplo de 4 que contenga lo pedido y se copian sus columnas.
+        let read_w = (w + 3) & !3;
+        let read_x = x.min(buffer_width.saturating_sub(read_w));
+        let skip = ((x - read_x) * 4) as usize;
+        let rows_per_chunk = (((PACKET_QWORDS - 8) * 16) as u32 / (read_w * 4)).max(1);
+        let mut row = 0;
+        while row < h {
+            let rows = rows_per_chunk.min(h - row);
+            let qwords = (rows * read_w / 4) as usize;
+            unsafe {
+                write64(GS_CSR, 2); // limpia FINISH
+                self.push(REG_BITBLTBUF, block as u64 | ((buffer_width / 64) as u64) << 16);
+                self.push(REG_TRXPOS, read_x as u64 | ((y + row) as u64) << 16);
+                self.push(REG_TRXREG, read_w as u64 | (rows as u64) << 32);
+                self.push(REG_FINISH, 0);
+                self.push(REG_TRXDIR, 1);
+                self.flush();
+                let mut spins = 0u32;
+                while read64(GS_CSR) & 2 == 0 && spins < 4_000_000 {
+                    spins += 1;
+                }
+                // El GS pasa a enviar y el VIF1 recibe por DMA.
+                write32(VIF1_STAT, 0x0080_0000);
+                write64(GS_BUSDIR, 1);
+                write32(D1_MADR, PACKET.0.get() as u32 & 0x1fff_ffff);
+                write32(D1_QWC, qwords as u32);
+                write32(D1_CHCR, 0x100);
+                while read32(D1_CHCR) & 0x100 != 0 {}
+                write32(VIF1_STAT, 0);
+                write64(GS_BUSDIR, 0);
+                write64(GS_CSR, 2);
+                for r in 0..rows {
+                    let from = (self.buf as *const u8).add((r * read_w * 4) as usize + skip);
+                    let to = pixels.as_mut_ptr().add(((row + r) * w * 4) as usize);
+                    core::ptr::copy_nonoverlapping(from, to, (w * 4) as usize);
+                }
+            }
+            row += rows;
+        }
+    }
+
+    /// Envía por DMA las primeras `qwords` palabras de 128 bits del paquete.
+    unsafe fn send(&mut self, qwords: usize) {
+        while read32(D2_CHCR) & 0x100 != 0 {}
+        write32(D2_MADR, PACKET.0.get() as u32 & 0x1fff_ffff);
+        write32(D2_QWC, qwords as u32);
+        write32(D2_CHCR, 0x101);
+        while read32(D2_CHCR) & 0x100 != 0 {}
+    }
+}

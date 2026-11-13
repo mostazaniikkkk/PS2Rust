@@ -456,6 +456,7 @@ pub fn convert(elf: &[u8]) -> Result<Irx, String> {
 }
 
 /// Lee de un IRX el rango de archivo de `.text` y su tamaño.
+#[cfg(test)]
 pub fn text_range(irx: &[u8]) -> Result<(usize, usize), String> {
     Ok(code_ranges(irx)?[0])
 }

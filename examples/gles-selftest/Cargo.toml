@@ -1,0 +1,10 @@
+[package]
+name = "gles-selftest"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+repository = "https://github.com/mostazaniikkkk/PS2Rust"
+
+[dependencies]
+ps2 = { path = "../../crates/ps2" }
+ps2-gles = { path = "../../crates/ps2-gles" }

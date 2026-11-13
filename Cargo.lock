@@ -10,6 +10,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gles-demo"
+version = "0.1.0"
+dependencies = [
+ "ps2",
+ "ps2-gles",
+]
+
+[[package]]
+name = "gles-selftest"
+version = "0.1.0"
+dependencies = [
+ "ps2",
+ "ps2-gles",
+]
+
+[[package]]
 name = "hello"
 version = "0.1.0"
 dependencies = [
@@ -44,6 +60,13 @@ dependencies = [
 [[package]]
 name = "ps2"
 version = "0.1.0"
+
+[[package]]
+name = "ps2-gles"
+version = "0.1.0"
+dependencies = [
+ "ps2",
+]
 
 [[package]]
 name = "ps2-iop"

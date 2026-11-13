@@ -6,7 +6,9 @@ el arranque, el kernel, la comunicación con el procesador de E/S, los hilos,
 los archivos y los gráficos están escritos en Rust.
 
 También compila **módulos IRX para el IOP** (el procesador de E/S, un MIPS
-R3000A con 2 MiB de RAM), sin std: ver [Rust en el IOP](#rust-en-el-iop).
+R3000A con 2 MiB de RAM), sin std: ver [Rust en el IOP](#rust-en-el-iop). Y
+trae **OpenGL ES 1.0** sobre el Graphics Synthesizer: ver
+[OpenGL ES 1.0](#opengl-es-10).
 
 | [`std-hello`](examples/std-hello/src/main.rs) | [`cube`](examples/cube/src/main.rs) | [`hello`](examples/hello/src/main.rs) |
 |---|---|---|
@@ -112,6 +114,68 @@ entre las dos mitades hay otras instrucciones, se reagrupan cuando se puede
 demostrar que es seguro (no tocan el registro ni la base, y ninguna es destino
 de un salto, contando las tablas de saltos de los datos).
 
+## OpenGL ES 1.0
+
+El crate [`ps2-gles`](crates/ps2-gles/src/lib.rs) implementa OpenGL ES 1.0
+(perfil Common) y un EGL 1.0 mínimo, con los nombres y las firmas de la
+especificación de Khronos: 106 funciones `gl*` (incluidas las variantes de coma
+fija) y 20 `egl*`. El código de GLES 1.0 se traduce casi línea a línea:
+
+```rust
+use ps2_gles::*;
+
+unsafe {
+    let display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    eglInitialize(display, null_mut(), null_mut());
+    let (mut config, mut count) = (0, 0);
+    eglChooseConfig(display, [EGL_DEPTH_SIZE, 16, EGL_NONE].as_ptr(), &mut config, 1, &mut count);
+    let surface = eglCreateWindowSurface(display, config, PS2_WINDOW_NTSC, null());
+    let context = eglCreateContext(display, config, EGL_NO_CONTEXT, null());
+    eglMakeCurrent(display, surface, surface, context);
+
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_LIGHTING);
+    glEnable(GL_LIGHT0);
+    glVertexPointer(3, GL_FLOAT, 0, vertices.as_ptr().cast());
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glDrawArrays(GL_TRIANGLES, 0, 36);
+    eglSwapBuffers(display, surface);
+}
+```
+
+![Cubo texturado e iluminado, suelo con mipmaps y niebla, cristales translúcidos](docs/gles-demo.png)
+
+La captura es [`gles-demo`](examples/gles-demo/src/main.rs): texturas con
+mipmaps, iluminación con brillo especular, niebla, mezcla alfa y búfer de
+profundidad, todo con llamadas estándar.
+
+El Emotion Engine hace lo que en GLES 1.0 es "geometría" (matrices,
+iluminación por vértice, niebla, recorte contra el volumen de visión, descarte
+de caras) y el Graphics Synthesizer rasteriza. Está todo lo de la
+especificación 1.0: los siete tipos de primitiva, arrays de vértices en todos
+sus formatos, las tres pilas de matrices, ocho luces (direccionales, puntuales
+y focos) con materiales, niebla lineal y exponencial, texturas en todos los
+formatos de 1.0 más las de paleta (`OES_compressed_paletted_texture`), filtros
+y mipmaps, pruebas de alfa, profundidad y recorte, mezcla, máscaras,
+`glReadPixels`, `glCopyTexImage2D` y los errores de GL.
+
+Lo que el GS no puede hacer, y cómo se comporta aquí:
+
+| De GLES 1.0 | En la PS2 |
+|---|---|
+| `glBlendFunc` | Exactas las 20 parejas formadas con `GL_ZERO`, `GL_ONE` y los alfas de origen y destino que caben en la fórmula del GS (entre ellas la transparencia normal y la aditiva). Las que usan un color como factor (`GL_DST_COLOR`…), `GL_SRC_ALPHA_SATURATE` y unas pocas como `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` no existen: se dibuja sin mezcla. El alfa que queda en el framebuffer es el del fragmento, sin mezclar. |
+| `glDepthFunc` | `GL_LESS`, `GL_LEQUAL`, `GL_ALWAYS` y `GL_NEVER` exactas. `GL_GREATER`/`GL_GEQUAL` funcionan si no se mezclan con las anteriores en el mismo frame. `GL_EQUAL` se trata como `GL_LEQUAL` y `GL_NOTEQUAL` como `GL_ALWAYS`. |
+| `glTexEnv` | `GL_MODULATE` y `GL_REPLACE` exactos; `GL_DECAL` exacto con texturas RGB (con RGBA ignora el alfa de la textura). `GL_BLEND` y `GL_ADD` se dibujan como `GL_MODULATE`. |
+| Stencil | Configuraciones sin stencil (0 bits), como permite la especificación: su prueba siempre pasa. |
+| `glLogicOp`, tramado, suavizado de puntos y líneas, multimuestreo | Se aceptan y no tienen efecto. |
+| Texturas | Potencias de dos hasta 512×512, una unidad de textura, hasta 7 niveles de mipmap con el nivel de detalle calculado por triángulo (las superficies grandes en perspectiva, como un suelo, conviene dividirlas en una rejilla). Se guardan en 32 bits: con 16 bits de profundidad quedan 1,27 MiB de memoria de vídeo para texturas (0,72 MiB con 24). |
+
+El crate también compila en el PC, donde rasteriza una referencia por software
+que sigue la especificación al pie de la letra. La batería
+[`gles-selftest`](examples/gles-selftest/src/gl_suite.rs) dibuja, lee los
+píxeles con `glReadPixels` y los compara con lo que manda la especificación:
+253 comprobaciones que pasan igual en el PC y en la PS2.
+
 ## Rust en el IOP
 
 La PS2 tiene un segundo procesador, el IOP: un R3000A (MIPS I, el de la
@@ -207,6 +271,7 @@ cargo ps2 check juego.elf          # ¿este ELF sólo usa instrucciones del R590
 cargo ps2 build --iop -p rustiop   # módulo del IOP -> target/ps2/rustiop.irx
 cargo ps2 run -p iop-demo          # el programa del EE que lo carga y lo llama
 cargo ps2 check modulo.irx         # ¿este IRX sólo usa instrucciones del R3000A?
+cargo ps2 run -p gles-demo         # OpenGL ES 1.0 sobre el Graphics Synthesizer
 cargo ps2 help
 ```
 
@@ -233,7 +298,9 @@ panic = "abort"
 ```
 
 Para un módulo del IOP, la dependencia es
-`ps2-iop = { git = "https://github.com/mostazaniikkkk/PS2Rust" }`.
+`ps2-iop = { git = "https://github.com/mostazaniikkkk/PS2Rust" }`; para OpenGL
+ES, `ps2-gles = { git = "https://github.com/mostazaniikkkk/PS2Rust" }`, con o
+sin std.
 
 El `.elf` resultante se puede cargar en PCSX2 (Sistema → Ejecutar ELF) o en una
 consola con un lanzador de homebrew.
@@ -247,7 +314,7 @@ defecto) añade el arranque, el asignador, el manejador de pánicos y
 
 | Módulo | Qué ofrece |
 |---|---|
-| `gs` | Graphics Synthesizer: NTSC/PAL, doble búfer, vsync, rectángulos, líneas, triángulos Gouraud, mezcla alfa, texto |
+| `gs` | Graphics Synthesizer: NTSC/PAL, doble búfer, vsync, rectángulos, líneas, triángulos Gouraud, mezcla alfa, texto. Y el acceso de bajo nivel sobre el que está hecho `ps2-gles`: registros, subida de imágenes y lectura de la memoria de vídeo |
 | `math` | `sqrt`, `sin`, `cos`, `floor` en `f32` sobre la FPU |
 | `kernel` | Syscalls del kernel del EE y registros de hardware de 32 y 64 bits |
 | `print!` / `println!` | Consola del EE, también sin std |
@@ -259,6 +326,7 @@ defecto) añade el arranque, el asignador, el manejador de pánicos y
 - [std-selftest](examples/std-selftest/src/std_suite.rs): batería de la std (25 comprobaciones, más las 33 de `core`/`alloc`).
 - [std-panic](examples/std-panic/src/main.rs): pánico en un hilo con nombre.
 - [hello](examples/hello/src/main.rs), [cube](examples/cube/src/main.rs), [selftest](examples/selftest/src/suite.rs), [panic](examples/panic/src/main.rs): los mismos temas sin std (`#![no_std]`).
+- [gles-demo](examples/gles-demo/src/main.rs) y [gles-selftest](examples/gles-selftest/src/gl_suite.rs): una escena con OpenGL ES 1.0 y su batería de pruebas de píxeles.
 - [iop-module](examples/iop-module/src/main.rs) (`rustiop.irx`) e [iop-demo](examples/iop-demo/src/main.rs): un módulo del IOP con servidor RPC y dos hilos, y el programa del EE que lo usa.
 - [iop-selftest](examples/iop-selftest/src/main.rs) e [iop-selftest-runner](examples/iop-selftest-runner/src/main.rs): la batería de `core`/`alloc` corriendo en el IOP, lanzada desde el EE.
 
@@ -268,11 +336,12 @@ defecto) añade el arranque, el asignador, el manejador de pánicos y
 powershell -ExecutionPolicy Bypass -File verify.ps1 -Emulator C:\ruta\pcsx2-qt.exe
 ```
 
-El script compila los nueve programas del EE y los dos módulos del IOP, los
-ejecuta en PCSX2 y comprueba los resultados (13 pasos). Las pruebas principales
+El script compila los once programas del EE y los dos módulos del IOP, los
+ejecuta en PCSX2 y comprueba los resultados (16 pasos). Las pruebas principales
 son diferenciales: las baterías se compilan tal cual para el PC y para la PS2,
 y las dos salidas deben coincidir byte a byte (212 líneas con la std en el EE;
-131 en el IOP, donde la misma batería corre sin FPU ni atómicos). Cubren enteros de 32/64/128
+131 en el IOP, donde la misma batería corre sin FPU ni atómicos; 275 la de
+OpenGL ES, que compara píxeles leídos del GS con la referencia). Cubren enteros de 32/64/128
 bits, `f64` por software, `f32` en la FPU, formato, colecciones, `Rc`/`Arc`,
 atómicos, el heap, UTF-8, hilos, `Mutex`/`Condvar`/`RwLock`/`Barrier`,
 canales, `thread_local!`, `sleep`, `SystemTime`, archivos (incluidos nombres
@@ -299,6 +368,16 @@ de 1 a 16 caracteres) y el entorno.
   PC, así que `modified()` puede desfasarse unas horas.
 - **Sin `std::net`, `std::process::Command` ni `stdin`.** El mando y el sonido
   tampoco están: viven en el IOP y necesitan sus propios módulos.
+- **OpenGL ES 1.0 no es conforme al 100 %**: la mezcla, la comparación de
+  profundidad y el entorno de textura tienen las diferencias de la tabla de
+  [OpenGL ES 1.0](#opengl-es-10), que vienen del hardware. La geometría se
+  calcula en la FPU del EE, en escalar: `gles-demo` mide unos 50 000
+  triángulos iluminados por segundo en PCSX2, es decir, cientos por frame a
+  60 Hz, muy lejos de un juego comercial (que usa las unidades vectoriales,
+  sin soporte aquí). No se enlaza con C: es para
+  programas en Rust. En PCSX2 con renderizado por hardware, `glReadPixels`
+  puede no ver el borde derecho e inferior de puntos y líneas recién dibujados
+  (el emulador sólo devuelve la zona que cree dibujada); en pantalla están.
 - **IOP: sin std, sin atómicos y sin FPU.** Sólo `core` y `alloc`; no hay
   `Arc` ni `core::sync::atomic` (para compartir datos entre hilos están
   `ps2_iop::sync::Mutex` y `kernel::critical`), y `f32`/`f64` van por software.

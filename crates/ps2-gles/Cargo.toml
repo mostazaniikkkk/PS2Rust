@@ -1,0 +1,10 @@
+[package]
+name = "ps2-gles"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+repository = "https://github.com/mostazaniikkkk/PS2Rust"
+description = "OpenGL ES 1.0 (perfil Common) y EGL para PlayStation 2, sobre el Graphics Synthesizer"
+
+[target.'cfg(target_arch = "mips")'.dependencies]
+ps2 = { path = "../ps2", default-features = false }

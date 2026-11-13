@@ -6,6 +6,8 @@
 //! * `--escaped`: la misma, con la codificación `%XX` de la consola.
 //! * `--iop`: la variante que corre en el IOP (sin atómicos, bloques más
 //!   pequeños), codificada, como `iop-selftest`.
+//! * `--gles`: la batería de OpenGL ES 1.0 (`gles-selftest`), con el
+//!   rasterizador por software de `ps2-gles` como referencia.
 //! * `--std`: `core`/`alloc` + std, codificada, como `std-selftest`.
 //!   Usa el directorio actual para las pruebas de archivos.
 
@@ -15,10 +17,18 @@ extern crate alloc;
 mod suite;
 #[path = "../../../examples/std-selftest/src/std_suite.rs"]
 mod std_suite;
+#[path = "../../../examples/gles-selftest/src/gl_suite.rs"]
+mod gl_suite;
 
 use std::fmt::Write as _;
 
 fn main() {
+    if std::env::args().any(|a| a == "--gles") {
+        let mut out = String::new();
+        let failed = gl_suite::run(&mut out);
+        print!("{out}");
+        std::process::exit(failed as i32);
+    }
     let iop = std::env::args().any(|a| a == "--iop");
     let env = if iop { suite::Env::iop(f32::sqrt) } else { suite::Env::ee(f32::sqrt) };
     let escaped = std::env::args().any(|a| a == "--escaped");

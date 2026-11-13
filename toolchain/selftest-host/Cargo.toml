@@ -7,5 +7,6 @@ repository = "https://github.com/mostazaniikkkk/PS2Rust"
 description = "Ejecuta la batería de pruebas en el PC para obtener la salida de referencia"
 
 [dependencies]
+ps2-gles = { path = "../../crates/ps2-gles" }
 
 [workspace]
