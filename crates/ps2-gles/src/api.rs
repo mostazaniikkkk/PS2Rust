@@ -87,7 +87,7 @@ pub fn glGetString(name: GLenum) -> *const GLubyte {
         GL_VENDOR => b"PS2Rust\0",
         GL_RENDERER => b"PlayStation 2 Graphics Synthesizer\0",
         GL_VERSION => b"OpenGL ES-CM 1.0\0",
-        GL_EXTENSIONS => b"GL_OES_byte_coordinates GL_OES_fixed_point GL_OES_single_precision GL_OES_read_format GL_OES_compressed_paletted_texture\0",
+        GL_EXTENSIONS => b"GL_OES_byte_coordinates GL_OES_fixed_point GL_OES_single_precision GL_OES_read_format GL_OES_compressed_paletted_texture GL_OES_matrix_palette\0",
         _ => {
             c.set_error(GL_INVALID_ENUM);
             return core::ptr::null();
@@ -111,6 +111,23 @@ pub unsafe fn glGetIntegerv(pname: GLenum, params: *mut GLint) {
         GL_MAX_TEXTURE_STACK_DEPTH => one(TEXTURE_DEPTH as i32),
         GL_MAX_TEXTURE_SIZE => one(MAX_TEXTURE_SIZE as i32),
         GL_MAX_TEXTURE_UNITS => one(1),
+        GL_MAX_PALETTE_MATRICES_OES => one(MAX_PALETTE_MATRICES as i32),
+        GL_MAX_VERTEX_UNITS_OES => one(MAX_VERTEX_UNITS as i32),
+        GL_CURRENT_PALETTE_MATRIX_OES => one(c.current_palette as i32),
+        GL_ARRAY_BUFFER_BINDING => one(c.array_buffer as i32),
+        GL_ELEMENT_ARRAY_BUFFER_BINDING => one(c.element_buffer as i32),
+        GL_VERTEX_ARRAY_BUFFER_BINDING => one(c.arrays[ARRAY_VERTEX].buffer as i32),
+        GL_NORMAL_ARRAY_BUFFER_BINDING => one(c.arrays[ARRAY_NORMAL].buffer as i32),
+        GL_COLOR_ARRAY_BUFFER_BINDING => one(c.arrays[ARRAY_COLOR].buffer as i32),
+        GL_TEXTURE_COORD_ARRAY_BUFFER_BINDING => one(c.arrays[ARRAY_TEXCOORD].buffer as i32),
+        GL_MATRIX_INDEX_ARRAY_BUFFER_BINDING_OES => one(c.arrays[ARRAY_MATRIX_INDEX].buffer as i32),
+        GL_WEIGHT_ARRAY_BUFFER_BINDING_OES => one(c.arrays[ARRAY_WEIGHT].buffer as i32),
+        GL_MATRIX_INDEX_ARRAY_SIZE_OES => one(c.arrays[ARRAY_MATRIX_INDEX].size),
+        GL_MATRIX_INDEX_ARRAY_TYPE_OES => one(c.arrays[ARRAY_MATRIX_INDEX].kind as i32),
+        GL_MATRIX_INDEX_ARRAY_STRIDE_OES => one(c.arrays[ARRAY_MATRIX_INDEX].stride),
+        GL_WEIGHT_ARRAY_SIZE_OES => one(c.arrays[ARRAY_WEIGHT].size),
+        GL_WEIGHT_ARRAY_TYPE_OES => one(c.arrays[ARRAY_WEIGHT].kind as i32),
+        GL_WEIGHT_ARRAY_STRIDE_OES => one(c.arrays[ARRAY_WEIGHT].stride),
         GL_MAX_VIEWPORT_DIMS => two(w as i32, h as i32),
         GL_MAX_ELEMENTS_VERTICES | GL_MAX_ELEMENTS_INDICES => one(65536),
         GL_SUBPIXEL_BITS => one(4),
@@ -172,6 +189,8 @@ fn set_client_state(array: GLenum, on: bool) {
         GL_NORMAL_ARRAY => ARRAY_NORMAL,
         GL_COLOR_ARRAY => ARRAY_COLOR,
         GL_TEXTURE_COORD_ARRAY => ARRAY_TEXCOORD,
+        GL_MATRIX_INDEX_ARRAY_OES => ARRAY_MATRIX_INDEX,
+        GL_WEIGHT_ARRAY_OES => ARRAY_WEIGHT,
         _ => fail!(c, GL_INVALID_ENUM),
     };
     c.arrays[index].enabled = on;
@@ -200,7 +219,7 @@ pub fn glClientActiveTexture(texture: GLenum) {
 
 pub fn glMatrixMode(mode: GLenum) {
     let c = ctx!();
-    if !matches!(mode, GL_MODELVIEW | GL_PROJECTION | GL_TEXTURE) {
+    if !matches!(mode, GL_MODELVIEW | GL_PROJECTION | GL_TEXTURE | GL_MATRIX_PALETTE_OES) {
         fail!(c, GL_INVALID_ENUM);
     }
     c.matrix_mode = mode;
@@ -372,7 +391,152 @@ unsafe fn set_pointer(index: usize, sizes: core::ops::RangeInclusive<i32>, types
         fail!(c, GL_INVALID_ENUM);
     }
     let enabled = c.arrays[index].enabled;
-    c.arrays[index] = Array { enabled, size, kind, stride, pointer: pointer as *const u8 };
+    c.arrays[index] = Array { enabled, size, kind, stride, pointer: pointer as *const u8, buffer: c.array_buffer };
+}
+
+/// `GL_OES_matrix_palette`: índices de las matrices de cada vértice.
+pub unsafe fn glMatrixIndexPointerOES(size: GLint, kind: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+    set_pointer(ARRAY_MATRIX_INDEX, 1..=MAX_VERTEX_UNITS as i32, &[GL_UNSIGNED_BYTE], size, kind, stride, pointer);
+}
+
+/// `GL_OES_matrix_palette`: pesos de las matrices de cada vértice.
+pub unsafe fn glWeightPointerOES(size: GLint, kind: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+    set_pointer(ARRAY_WEIGHT, 1..=MAX_VERTEX_UNITS as i32, &[GL_FIXED, GL_FLOAT], size, kind, stride, pointer);
+}
+
+/// `GL_OES_matrix_palette`: matriz de la paleta sobre la que actúan las
+/// funciones de matrices con `glMatrixMode(GL_MATRIX_PALETTE_OES)`.
+pub fn glCurrentPaletteMatrixOES(index: GLuint) {
+    let c = ctx!();
+    if index as usize >= MAX_PALETTE_MATRICES {
+        fail!(c, GL_INVALID_VALUE);
+    }
+    c.current_palette = index as usize;
+}
+
+/// `GL_OES_matrix_palette`: copia la modelview a la matriz actual de la paleta.
+pub fn glLoadPaletteFromModelViewMatrixOES() {
+    let c = ctx!();
+    c.palette[c.current_palette][0] = *c.modelview.last().unwrap();
+}
+
+// ---------------------------------------------------------------- objetos de búfer
+
+pub unsafe fn glGenBuffers(n: GLsizei, buffers: *mut GLuint) {
+    let c = ctx!();
+    if n < 0 {
+        fail!(c, GL_INVALID_VALUE);
+    }
+    for i in 0..n as usize {
+        buffers.add(i).write_unaligned(c.next_buffer);
+        c.next_buffer += 1;
+    }
+}
+
+pub unsafe fn glDeleteBuffers(n: GLsizei, buffers: *const GLuint) {
+    let c = ctx!();
+    if n < 0 {
+        fail!(c, GL_INVALID_VALUE);
+    }
+    for i in 0..n as usize {
+        let name = buffers.add(i).read_unaligned();
+        if name == 0 || c.buffers.remove(&name).is_none() {
+            continue;
+        }
+        c.forget_buffer(name);
+        // Como en GL: deja de estar enlazado donde lo estuviera.
+        if c.array_buffer == name {
+            c.array_buffer = 0;
+        }
+        if c.element_buffer == name {
+            c.element_buffer = 0;
+        }
+        for array in c.arrays.iter_mut().filter(|a| a.buffer == name) {
+            array.buffer = 0;
+            array.pointer = core::ptr::null();
+        }
+    }
+}
+
+pub fn glBindBuffer(target: GLenum, buffer: GLuint) {
+    let c = ctx!();
+    let binding = match target {
+        GL_ARRAY_BUFFER => &mut c.array_buffer,
+        GL_ELEMENT_ARRAY_BUFFER => &mut c.element_buffer,
+        _ => fail!(c, GL_INVALID_ENUM),
+    };
+    *binding = buffer;
+    if buffer != 0 {
+        c.buffers.entry(buffer).or_insert_with(|| Buffer { data: Vec::new(), usage: GL_STATIC_DRAW });
+        c.next_buffer = c.next_buffer.max(buffer + 1);
+    }
+}
+
+pub fn glIsBuffer(buffer: GLuint) -> GLboolean {
+    let c = ctx!(GL_FALSE);
+    (buffer != 0 && c.buffers.contains_key(&buffer)) as GLboolean
+}
+
+/// Búfer enlazado en `target`, anotando el error que toque si no hay.
+fn bound_buffer(c: &mut Context, target: GLenum) -> Option<GLuint> {
+    let name = match target {
+        GL_ARRAY_BUFFER => c.array_buffer,
+        GL_ELEMENT_ARRAY_BUFFER => c.element_buffer,
+        _ => {
+            c.set_error(GL_INVALID_ENUM);
+            return None;
+        }
+    };
+    if name == 0 {
+        c.set_error(GL_INVALID_OPERATION);
+        return None;
+    }
+    Some(name)
+}
+
+pub unsafe fn glBufferData(target: GLenum, size: GLsizeiptr, data: *const GLvoid, usage: GLenum) {
+    let c = ctx!();
+    let Some(name) = bound_buffer(c, target) else { return };
+    if !matches!(usage, GL_STATIC_DRAW | GL_DYNAMIC_DRAW) {
+        fail!(c, GL_INVALID_ENUM);
+    }
+    if size < 0 {
+        fail!(c, GL_INVALID_VALUE);
+    }
+    c.forget_buffer(name);
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(size as usize).is_err() {
+        fail!(c, GL_OUT_OF_MEMORY);
+    }
+    if data.is_null() {
+        bytes.resize(size as usize, 0);
+    } else {
+        bytes.extend_from_slice(core::slice::from_raw_parts(data as *const u8, size as usize));
+    }
+    c.buffers.insert(name, Buffer { data: bytes, usage });
+}
+
+pub unsafe fn glBufferSubData(target: GLenum, offset: GLintptr, size: GLsizeiptr, data: *const GLvoid) {
+    let c = ctx!();
+    let Some(name) = bound_buffer(c, target) else { return };
+    let length = c.buffers[&name].data.len();
+    if offset < 0 || size < 0 || offset as usize + size as usize > length {
+        fail!(c, GL_INVALID_VALUE);
+    }
+    c.forget_buffer(name);
+    let buffer = c.buffers.get_mut(&name).unwrap();
+    buffer.data[offset as usize..offset as usize + size as usize].copy_from_slice(core::slice::from_raw_parts(data as *const u8, size as usize));
+}
+
+pub unsafe fn glGetBufferParameteriv(target: GLenum, pname: GLenum, params: *mut GLint) {
+    let c = ctx!();
+    let Some(name) = bound_buffer(c, target) else { return };
+    let buffer = &c.buffers[&name];
+    match pname {
+        GL_BUFFER_SIZE => params.write_unaligned(buffer.data.len() as i32),
+        GL_BUFFER_USAGE => params.write_unaligned(buffer.usage as i32),
+        _ => c.set_error(GL_INVALID_ENUM),
+    }
 }
 
 pub unsafe fn glVertexPointer(size: GLint, kind: GLenum, stride: GLsizei, pointer: *const GLvoid) {
@@ -399,7 +563,7 @@ pub unsafe fn glDrawArrays(mode: GLenum, first: GLint, count: GLsizei) {
     if count < 0 || first < 0 {
         fail!(c, GL_INVALID_VALUE);
     }
-    c.draw(mode, count as usize, Some(first as usize), &|i| first as usize + i);
+    c.draw(mode, count as usize, Some(first as usize), &|i| first as usize + i, None);
 }
 
 pub unsafe fn glDrawElements(mode: GLenum, count: GLsizei, kind: GLenum, indices: *const GLvoid) {
@@ -410,12 +574,24 @@ pub unsafe fn glDrawElements(mode: GLenum, count: GLsizei, kind: GLenum, indices
     if count < 0 {
         fail!(c, GL_INVALID_VALUE);
     }
+    // Con un búfer de índices enlazado, `indices` es un desplazamiento en él.
+    let (mut indices, mut source) = (indices as *const u8, None);
+    if c.element_buffer != 0 {
+        let offset = indices as usize;
+        let width = if kind == GL_UNSIGNED_BYTE { 1 } else { 2 };
+        let data = &c.buffers[&c.element_buffer].data;
+        if offset + count as usize * width > data.len() {
+            fail!(c, GL_INVALID_OPERATION);
+        }
+        indices = data.as_ptr().add(offset);
+        source = Some((c.element_buffer, kind, offset));
+    }
     if kind == GL_UNSIGNED_BYTE {
-        let p = indices as *const u8;
-        c.draw(mode, count as usize, None, &|i| p.add(i).read() as usize);
+        let p = indices;
+        c.draw(mode, count as usize, None, &|i| p.add(i).read() as usize, source);
     } else {
         let p = indices as *const u16;
-        c.draw(mode, count as usize, None, &|i| p.add(i).read_unaligned() as usize);
+        c.draw(mode, count as usize, None, &|i| p.add(i).read_unaligned() as usize, source);
     }
 }
 

@@ -8,13 +8,17 @@
 
 use crate::raster::*;
 use crate::soft::SoftRasterizer;
-use crate::vu1prog::{self, Key, Target, BATCH, CONSTANTS, C_COUNT, INPUT};
+use crate::vu1prog::{self, Key, Target, CONSTANTS, C_COUNT, PALETTE};
+use std::collections::BTreeMap;
 use crate::vuinterp::Vu;
 
 const ORIGIN: f32 = 1024.0;
 
 /// Triángulos que han pasado por el microprograma en todo el proceso.
 pub static FAST_TRIANGLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Vértices que el núcleo de GL ha tenido que leer y entregar (los de la
+/// geometría retenida sólo cuentan la primera vez).
+pub static FILLED_VERTICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub struct VuSoftRasterizer {
     soft: SoftRasterizer,
@@ -23,11 +27,14 @@ pub struct VuSoftRasterizer {
     program: Option<(Key, Vec<u64>)>,
     /// Valores de K (nivel de detalle) de los últimos triángulos con textura.
     pub last_lod: Vec<i32>,
+    /// Geometría retenida: (matrices por vértice, vértices).
+    retained: BTreeMap<u32, (usize, Vec<f32>)>,
+    next_retained: u32,
 }
 
 impl VuSoftRasterizer {
     pub fn new(width: u32, height: u32, depth_bits: u32) -> VuSoftRasterizer {
-        VuSoftRasterizer { soft: SoftRasterizer::new(width, height, depth_bits), state: State::DEFAULT, vu: Vu::new(), program: None, last_lod: Vec::new() }
+        VuSoftRasterizer { soft: SoftRasterizer::new(width, height, depth_bits), state: State::DEFAULT, vu: Vu::new(), program: None, last_lod: Vec::new(), retained: BTreeMap::new(), next_retained: 1 }
     }
 
     /// Instrucciones de VU ejecutadas hasta ahora.
@@ -81,7 +88,45 @@ impl Rasterizer for VuSoftRasterizer {
         self.soft.swap()
     }
 
-    fn fast_triangles(&mut self, setup: &FastSetup, count: usize, fill: &mut dyn FnMut(&mut [FastVertex])) -> bool {
+    fn fast_triangles(&mut self, setup: &FastSetup, count: usize, fill: &mut dyn FnMut(&mut [f32])) -> bool {
+        let mut vertices = vec![0.0f32; count * fast_vertex_floats(setup.skin)];
+        fill(&mut vertices);
+        FILLED_VERTICES.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+        self.run(setup, &vertices);
+        true
+    }
+
+    fn fast_retain(&mut self, units: usize, count: usize, fill: &mut dyn FnMut(&mut [f32])) -> Option<u32> {
+        let mut vertices = vec![0.0f32; count * fast_vertex_floats(units)];
+        fill(&mut vertices);
+        FILLED_VERTICES.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+        let id = self.next_retained;
+        self.next_retained += 1;
+        self.retained.insert(id, (units, vertices));
+        Some(id)
+    }
+
+    fn fast_retained(&mut self, setup: &FastSetup, id: u32) -> bool {
+        let Some((units, vertices)) = self.retained.remove(&id) else { return false };
+        assert_eq!(units, setup.skin, "geometría retenida con otro formato de vértice");
+        self.run(setup, &vertices);
+        self.retained.insert(id, (units, vertices));
+        true
+    }
+
+    fn fast_release(&mut self, id: u32) {
+        self.retained.remove(&id);
+    }
+}
+
+impl VuSoftRasterizer {
+    /// Geometrías retenidas ahora mismo.
+    pub fn retained_count(&self) -> usize {
+        self.retained.len()
+    }
+
+    /// Pasa `vertices` (triángulos sueltos) por el microprograma.
+    fn run(&mut self, setup: &FastSetup, vertices: &[f32]) {
         let (_, height) = self.soft.size();
         let depth_max = ((1u64 << self.soft.depth_bits()) - 1) as f32;
         let texture = self.state.texture;
@@ -97,20 +142,20 @@ impl Rasterizer for VuSoftRasterizer {
         let code = &self.program.as_ref().unwrap().1;
         assert!(code.len() <= 2048, "el microprograma no cabe en la VU1");
         self.vu.mem[..CONSTANTS].copy_from_slice(&vu1prog::constants(setup, &target));
+        if key.skin > 0 {
+            let palette = vu1prog::palette(setup);
+            self.vu.mem[PALETTE..PALETTE + palette.len()].copy_from_slice(&palette);
+        }
         self.last_lod.clear();
-        let mut remaining = count;
-        while remaining > 0 {
-            let mut batch = vec![[0.0f32; 12]; remaining.min(BATCH * 3)];
-            fill(&mut batch);
-            remaining -= batch.len();
-            for (i, vertex) in batch.iter().enumerate() {
-                for word in 0..3 {
-                    self.vu.mem[INPUT + i * 3 + word] = [0, 1, 2, 3].map(|c| vertex[word * 4 + c].to_bits());
-                }
+        let words = key.vertex_words();
+        for batch in vertices.chunks(key.batch() * 3 * words * 4) {
+            for (i, word) in batch.chunks(4).enumerate() {
+                self.vu.mem[key.input() + i] = [0, 1, 2, 3].map(|c| word[c].to_bits());
             }
-            self.vu.mem[C_COUNT] = vu1prog::batch_header(batch.len() / 3);
+            let triangles = batch.len() / (12 * words);
+            self.vu.mem[C_COUNT] = vu1prog::batch_header(triangles);
             self.vu.run(code, 0);
-            FAST_TRIANGLES.fetch_add((batch.len() / 3) as u64, std::sync::atomic::Ordering::Relaxed);
+            FAST_TRIANGLES.fetch_add(triangles as u64, std::sync::atomic::Ordering::Relaxed);
             // Lo enviado al GS, de vuelta a vértices para el rasterizador.
             for packet in core::mem::take(&mut self.vu.kicked) {
                 let record = if lod.is_some() { 10 } else { 9 };
@@ -139,6 +184,5 @@ impl Rasterizer for VuSoftRasterizer {
                 }
             }
         }
-        true
     }
 }

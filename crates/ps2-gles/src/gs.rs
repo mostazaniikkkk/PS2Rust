@@ -107,6 +107,34 @@ pub struct GsRasterizer {
 }
 
 impl GsRasterizer {
+    /// Microprograma y constantes de la VU1 para una llamada de dibujo, con
+    /// el estado ya en el GS.
+    fn fast_begin(&mut self, setup: &FastSetup) -> (Key, [[u32; 4]; vu1prog::CONSTANTS]) {
+        // El estado va al GS por el GIF antes que los vértices de la VU1.
+        self.gs.flush();
+        let lod = match (self.needs_lod, self.state.texture) {
+            (true, Some(t)) => Some((self.tex1 as u32, (t.width * t.height) as f32)),
+            _ => None,
+        };
+        let target = Target {
+            height: self.height as f32,
+            origin: ORIGIN,
+            depth_max: ((1u32 << self.depth_bits) - 1) as f32,
+            inverted: self.inverted,
+            color_scale: if self.textured { 128.0 } else { 255.0 },
+            prim: (PRIM_TRIANGLE | self.prim_flags) as u32,
+            lod,
+        };
+        (Key::of(setup, &target), vu1prog::constants(setup, &target))
+    }
+
+    fn fast_end(&mut self, count: usize) {
+        self.fast_triangles += (count / 3) as u64;
+        // La VU1 ha dejado en el GS su PRIM y, con mipmaps, su TEX1.
+        self.prim = None;
+        self.lod_k = i32::MIN;
+    }
+
     pub fn new(mode: VideoMode, depth_bits: u32) -> GsRasterizer {
         let gs = Gs::init(mode);
         let (width, height) = (gs.width() as u32, gs.height() as u32);
@@ -492,7 +520,7 @@ impl Rasterizer for GsRasterizer {
         self.gs.flush();
     }
 
-    fn fast_triangles(&mut self, setup: &FastSetup, count: usize, fill: &mut dyn FnMut(&mut [FastVertex])) -> bool {
+    fn fast_triangles(&mut self, setup: &FastSetup, count: usize, fill: &mut dyn FnMut(&mut [f32])) -> bool {
         if !self.applied {
             self.apply();
         }
@@ -503,33 +531,45 @@ impl Rasterizer for GsRasterizer {
         if self.nothing_visible || count < 3 {
             // Nada que dibujar, pero los vértices hay que consumirlos igual.
             return count < 3 || {
-                let mut skipped = [[0.0f32; 12]; 3];
-                (0..count / 3).for_each(|_| fill(&mut skipped));
+                let mut skipped = [0.0f32; 60];
+                let floats = 3 * fast_vertex_floats(setup.skin);
+                (0..count / 3).for_each(|_| fill(&mut skipped[..floats]));
                 true
             };
         }
-        // El estado va al GS por el GIF antes que los vértices de la VU1.
-        self.gs.flush();
-        let lod = match (self.needs_lod, self.state.texture) {
-            (true, Some(t)) => Some((self.tex1 as u32, (t.width * t.height) as f32)),
-            _ => None,
-        };
-        let target = Target {
-            height: self.height as f32,
-            origin: ORIGIN,
-            depth_max: ((1u32 << self.depth_bits) - 1) as f32,
-            inverted: self.inverted,
-            color_scale: if self.textured { 128.0 } else { 255.0 },
-            prim: (PRIM_TRIANGLE | self.prim_flags) as u32,
-            lod,
-        };
-        let key = Key::of(setup, &target);
-        self.vu1.draw(&key, &vu1prog::constants(setup, &target), count, fill);
-        self.fast_triangles += (count / 3) as u64;
-        // La VU1 ha dejado en el GS su PRIM y, con mipmaps, su TEX1.
-        self.prim = None;
-        self.lod_k = i32::MIN;
+        let (key, constants) = self.fast_begin(setup);
+        let palette = (setup.skin > 0).then(|| vu1prog::palette(setup));
+        self.vu1.draw(&key, &constants, palette.as_ref().map(|p| &p[..]), count, fill);
+        self.fast_end(count);
         true
+    }
+
+    fn fast_retain(&mut self, units: usize, count: usize, fill: &mut dyn FnMut(&mut [f32])) -> Option<u32> {
+        Some(self.vu1.retain(units, count, fill))
+    }
+
+    fn fast_retained(&mut self, setup: &FastSetup, id: u32) -> bool {
+        if !self.applied {
+            self.apply();
+        }
+        if self.opaque_vertex_alpha {
+            return false;
+        }
+        let Some(count) = self.vu1.retained_vertices(id) else { return false };
+        if self.nothing_visible {
+            return true;
+        }
+        let (key, constants) = self.fast_begin(setup);
+        let palette = (setup.skin > 0).then(|| vu1prog::palette(setup));
+        if !self.vu1.draw_retained(&key, &constants, palette.as_ref().map(|p| &p[..]), id) {
+            return false;
+        }
+        self.fast_end(count);
+        true
+    }
+
+    fn fast_release(&mut self, id: u32) {
+        self.vu1.release(id);
     }
 
     fn fast_triangle_count(&self) -> u64 {

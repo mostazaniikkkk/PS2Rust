@@ -8,7 +8,8 @@ los archivos y los gráficos están escritos en Rust.
 También compila **módulos IRX para el IOP** (el procesador de E/S, un MIPS
 R3000A con 2 MiB de RAM), sin std: ver [Rust en el IOP](#rust-en-el-iop). Y
 trae **OpenGL ES 1.0** sobre el Graphics Synthesizer, con la geometría en la
-unidad vectorial VU1 ([OpenGL ES 1.0](#opengl-es-10))
+unidad vectorial VU1, mallas estáticas retenidas y mallas animadas con paleta
+de matrices ([OpenGL ES 1.0](#opengl-es-10)),
 **red** (`std::net` con una pila TCP/IP propia, más HTTP y WebSocket: [Red](#red))
 y **mando y sonido** (DualShock 2 con presión y vibración, flujo PCM y voces
 ADPCM: [Mando y sonido](#mando-y-sonido)).
@@ -121,7 +122,7 @@ de un salto, contando las tablas de saltos de los datos).
 
 El crate [`ps2-gles`](crates/ps2-gles/src/lib.rs) implementa OpenGL ES 1.0
 (perfil Common) y un EGL 1.0 mínimo, con los nombres y las firmas de la
-especificación de Khronos: 106 funciones `gl*` (incluidas las variantes de coma
+especificación de Khronos: 117 funciones `gl*` (incluidas las variantes de coma
 fija) y 20 `egl*`. El código de GLES 1.0 se traduce casi línea a línea:
 
 ```rust
@@ -146,11 +147,13 @@ unsafe {
 }
 ```
 
-![Cubo texturado e iluminado, suelo con mipmaps y niebla, cristales translúcidos](docs/gles-demo.png)
+![Cubo texturado e iluminado, suelo con mipmaps y niebla, cristales translúcidos y tallos animados](docs/gles-demo.png)
 
 La captura es [`gles-demo`](examples/gles-demo/src/main.rs): texturas con
 mipmaps, iluminación con brillo especular, niebla, mezcla alfa y búfer de
-profundidad, todo con llamadas estándar.
+profundidad, todo con llamadas estándar. Los tallos verdes son una sola malla
+animada con paleta de matrices; el suelo, los cristales y los tallos están en
+objetos de búfer.
 
 Está todo lo de la especificación 1.0: los siete tipos de primitiva, arrays de
 vértices en todos sus formatos, las tres pilas de matrices, ocho luces
@@ -158,7 +161,9 @@ vértices en todos sus formatos, las tres pilas de matrices, ocho luces
 texturas en todos los formatos de 1.0 más las de paleta
 (`OES_compressed_paletted_texture`), filtros y mipmaps, pruebas de alfa,
 profundidad y recorte, mezcla, máscaras, `glReadPixels`, `glCopyTexImage2D` y
-los errores de GL.
+los errores de GL. Y dos cosas de fuera de 1.0 que en esta consola hacen
+falta: los **objetos de búfer** de 1.1 (`glBufferData` y compañía) y la
+extensión **`GL_OES_matrix_palette`** (ver más abajo).
 
 ### La geometría, en la VU1
 
@@ -171,12 +176,15 @@ cambia nada: son las mismas llamadas de GL, más rápidas.
 | | Triángulos iluminados por segundo (malla indexada de 2048, en PCSX2) |
 |---|---|
 | Todo en la FPU del Emotion Engine (antes) | unos 53 000 |
-| Geometría en la VU1 | unos 350 000 |
+| Geometría en la VU1, vértices en memoria del programa | unos 350 000 |
+| Geometría en la VU1, vértices en un objeto de búfer estático | el EE deja de ser el límite (ver [geometría retenida](#geometría-retenida-objetos-de-búfer)) |
 
 - **El microprograma** ([vu1prog.rs](crates/ps2-gles/src/vu1prog.rs)) se
   genera a medida del estado de GL: sin luces no lleva código de luces, cada
   luz lleva el de su tipo, etc., así que dentro no hay comprobaciones de modo.
-  Cuesta entre 180 y 470 instrucciones por triángulo (de sin luces a ocho).
+  Cuesta entre 180 y 470 instrucciones por triángulo (de sin luces a ocho);
+  con paleta de matrices, entre 220 y 420 (de una matriz por vértice sin
+  luces a cuatro con una luz).
 - **Recorte de verdad**: un triángulo que cruza el plano cercano o el lejano,
   o se sale de la banda de guarda del GS, se recorta en la VU1 contra los seis
   planos (un suelo que pasa bajo la cámara no se pierde ni vuelve a la CPU).
@@ -197,6 +205,94 @@ iluminación a dos caras, `glPolygonOffset`, vértices con `w`, y los puntos y
 las líneas. `ps2_gles::fast_triangles()` dice cuántos triángulos han ido por
 la VU1.
 
+### Geometría retenida: objetos de búfer
+
+Con los vértices en memoria del programa (`glVertexPointer` con un puntero),
+GL tiene que leerlos y copiarlos en cada dibujo, porque pueden haber
+cambiado: ése era el techo de los 350 000 triángulos por segundo. Con los
+**objetos de búfer** de OpenGL ES 1.1 el contenido es de GL, y aquí eso se
+aprovecha del todo:
+
+```rust
+glGenBuffers(1, &mut buffer);
+glBindBuffer(GL_ARRAY_BUFFER, buffer);
+glBufferData(GL_ARRAY_BUFFER, bytes, vertices.as_ptr().cast(), GL_STATIC_DRAW);
+glVertexPointer(3, GL_FLOAT, stride, 0 as *const GLvoid);   // desplazamiento en el búfer
+// …lo mismo con normales, colores, coordenadas de textura e índices
+// (GL_ELEMENT_ARRAY_BUFFER)…
+glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_SHORT, 0 as *const GLvoid);
+```
+
+La primera vez que se dibuja desde búferes `GL_STATIC_DRAW`, `ps2-gles` arma
+el paquete de DMA con los vértices ya en el formato de la VU1 y **lo guarda**.
+En los dibujos siguientes el Emotion Engine sólo envía las matrices, las
+luces y el resto de constantes (un kilobyte), y el DMA manda los vértices a la
+VU1 directamente desde donde quedaron: un nivel entero se redibuja cada frame
+sin que la CPU toque un vértice. Cambiar la matriz, las luces, la niebla, la
+textura, la mezcla o el color actual no obliga a rehacer nada.
+
+- En PCSX2 la malla de la tabla pasa a "11 millones de triángulos por
+  segundo", pero ese número sólo dice que el EE ya casi no trabaja (0,09 µs
+  por triángulo): el emulador no cuenta el tiempo de la VU1. En una consola
+  el límite pasa a ser la propia VU1; por su número de instrucciones (256 por
+  triángulo con una luz), algo más de un millón por segundo.
+- Están `glGenBuffers`, `glBindBuffer`, `glBufferData`, `glBufferSubData`,
+  `glDeleteBuffers`, `glIsBuffer` y `glGetBufferParameteriv`, con
+  `GL_ARRAY_BUFFER` y `GL_ELEMENT_ARRAY_BUFFER`. Se pueden mezclar arrays en
+  búferes y en memoria del programa; se retiene sólo cuando todo lo que se
+  dibuja sale de búferes estáticos. Los `GL_DYNAMIC_DRAW` funcionan igual
+  pero se leen en cada dibujo.
+- `glBufferData` y `glBufferSubData` descartan lo retenido de ese búfer, que
+  se rehace en el dibujo siguiente. Cada tramo distinto de un búfer (otro
+  `first`/`count`, otros índices) es una geometría retenida aparte.
+- **Memoria**: la VU1 recibe triángulos sueltos, así que lo retenido ocupa
+  144 bytes por triángulo (240 con paleta de matrices), además del búfer
+  original. Hay un límite de 8 MiB (unos 58 000 triángulos) que se cambia con
+  `ps2_gles::set_retained_budget(bytes)`; al llenarse se suelta lo que lleva
+  más tiempo sin dibujarse. `ps2_gles::retained_triangles()` y
+  `retained_bytes()` dicen cuánto se está aprovechando.
+- Sólo se retiene lo que va por la VU1 (lo de la lista de arriba).
+
+### Mallas animadas: paleta de matrices
+
+Con [`GL_OES_matrix_palette`](https://registry.khronos.org/OpenGL/extensions/OES/OES_matrix_palette.txt)
+cada vértice lleva los índices de hasta cuatro matrices de una paleta de 32 y
+un peso para cada una, y su modelview es la mezcla. Es el *skinning* de un
+personaje con huesos, y aquí **lo hace la VU1**: mezcla las matrices,
+transforma la posición y lleva la normal con la traspuesta de la inversa de
+la matriz mezclada, como pide la extensión.
+
+```rust
+// La pose: una matriz por hueso.
+glMatrixMode(GL_MATRIX_PALETTE_OES);
+for (i, bone) in bones.iter().enumerate() {
+    glCurrentPaletteMatrixOES(i as GLuint);
+    glLoadMatrixf(bone.as_ptr());              // o glLoadPaletteFromModelViewMatrixOES()
+}
+// La malla: además de posiciones y normales, índices y pesos.
+glEnable(GL_MATRIX_PALETTE_OES);
+glEnableClientState(GL_MATRIX_INDEX_ARRAY_OES);
+glEnableClientState(GL_WEIGHT_ARRAY_OES);
+glMatrixIndexPointerOES(4, GL_UNSIGNED_BYTE, stride, indices);
+glWeightPointerOES(4, GL_FLOAT, stride, weights);
+glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_SHORT, triangles);
+```
+
+Si la malla está en objetos de búfer estáticos, también queda retenida: en
+cada frame el Emotion Engine sólo calcula las matrices de los huesos y las
+envía (2 KiB); ningún vértice pasa por la CPU, por muchos que tenga el
+personaje.
+
+- `GL_MAX_PALETTE_MATRICES_OES` = 32 y `GL_MAX_VERTEX_UNITS_OES` = 4. Un
+  modelo con más huesos se dibuja por partes, cada una con su paleta.
+- Los pesos se usan tal cual (no se normalizan ni se calcula el último); lo
+  normal es que sumen 1.
+- Con la paleta activa `GL_RESCALE_NORMAL` equivale a `GL_NORMALIZE` (no hay
+  un único factor de escala). Con luces puntuales, la VU1 supone que los
+  pesos suman 1.
+- Con lo que no va por la VU1 (brillo especular, focos…) el *skinning* lo
+  hace el Emotion Engine, con el mismo resultado.
+
 Lo que el GS no puede hacer, y cómo se comporta aquí:
 
 | De GLES 1.0 | En la PS2 |
@@ -212,7 +308,7 @@ El crate también compila en el PC, donde rasteriza una referencia por software
 que sigue la especificación al pie de la letra. La batería
 [`gles-selftest`](examples/gles-selftest/src/gl_suite.rs) dibuja, lee los
 píxeles con `glReadPixels` y los compara con lo que manda la especificación:
-253 comprobaciones que pasan igual en el PC y en la PS2 (donde los triángulos
+315 comprobaciones que pasan igual en el PC y en la PS2 (donde los triángulos
 van por la VU1), y también en el PC con el microprograma interpretado.
 
 ## Red
@@ -532,7 +628,7 @@ PCSX2 que tenga el mando 1 en el teclado). La batería de mando y sonido hace
 sonar tonos cortos y bajos. Las pruebas principales
 son diferenciales: las baterías se compilan tal cual para el PC y para la PS2,
 y las dos salidas deben coincidir byte a byte (212 líneas con la std en el EE;
-131 en el IOP, donde la misma batería corre sin FPU ni atómicos; 275 la de
+131 en el IOP, donde la misma batería corre sin FPU ni atómicos; 339 la de
 OpenGL ES, que compara píxeles leídos del GS con la referencia; 98 la de
 red, en la que la PS2 y el PC hablan con el mismo servidor de pruebas, que el
 script levanta en 127.0.0.2 y sólo es accesible desde el propio PC). La demo
@@ -553,8 +649,11 @@ de 1 a 16 caracteres) y el entorno.
   pierde la CPU en medio de una operación y los manejadores de interrupción no
   los usan.
 - **ABI o32 de 32 bits.** No se puede enlazar con las bibliotecas C de PS2SDK
-  (que usan n32). `u64` funciona pero con pares de registros; no hay acceso a
-  los registros de 128 bits (MMI) ni a las unidades vectoriales.
+  (que usan n32). `u64` funciona pero con pares de registros, y el código Rust
+  no puede usar los registros de 128 bits (MMI) ni los de la VU0 como
+  coprocesador. La VU1 sí se usa: `ps2-gles` le envía un microprograma hecho
+  con su propio ensamblador (ver [OpenGL ES 1.0](#opengl-es-10)), pero no hay
+  forma de escribir microprogramas en Rust.
 - **`f32` sigue la FPU de la PS2**, no IEEE 754: sin NaN, infinitos ni
   denormales, y redondeo hacia cero. `f64` sí es IEEE 754 (por software, lento).
 - **Archivos**: el FILEIO de la BIOS no sabe renombrar (`rename` copia y borra,
@@ -589,11 +688,16 @@ de 1 a 16 caracteres) y el entorno.
   [OpenGL ES 1.0](#opengl-es-10), que vienen del hardware. La geometría de
   los triángulos va por la VU1 salvo con brillo especular, focos, niebla
   exponencial, dos caras o `glPolygonOffset`, que siguen en la FPU del EE
-  (unas siete veces más lento). Con la VU1 el límite lo pone el EE, que aún
-  lee y copia cada vértice: unos 350 000 triángulos por segundo en PCSX2, que
-  no cuenta el tiempo de la VU1 (en una consola irían en paralelo; por el
-  número de instrucciones, la VU1 daría para más del doble). El microprograma
-  va con una instrucción por posición, sin emparejar; hay margen. No se enlaza con C: es para
+  (unas siete veces más lento). Con los vértices en memoria del programa el
+  límite lo pone el EE, que los lee y copia en cada dibujo (unos 350 000
+  triángulos por segundo); desde objetos de búfer estáticos quedan retenidos
+  y el límite es la VU1, que no se ha medido en una consola: PCSX2 no cuenta
+  su tiempo, y la cifra de "algo más de un millón por segundo" sale de contar
+  instrucciones. El microprograma va con una instrucción por posición, sin
+  emparejar; hay margen. La geometría retenida ocupa 144 bytes por triángulo.
+  De OpenGL ES 1.1 sólo están los objetos de búfer, y de las extensiones de
+  *skinning*, `GL_OES_matrix_palette` (no `OES_draw_texture`, planos de
+  recorte de usuario, puntos con tamaño por vértice ni el resto de 1.1). No se enlaza con C: es para
   programas en Rust. En PCSX2 con renderizado por hardware, `glReadPixels`
   puede no ver el borde derecho e inferior de puntos y líneas recién dibujados
   (el emulador sólo devuelve la zona que cree dibujada); en pantalla están.

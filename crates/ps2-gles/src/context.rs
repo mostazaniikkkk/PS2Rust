@@ -17,6 +17,13 @@ pub const MAX_TEXTURE_SIZE: u32 = 512;
 pub const MAX_LEVELS: usize = 10;
 /// Niveles que el rasterizador puede usar a la vez (límite del GS).
 pub const USABLE_LEVELS: u32 = 7;
+/// Matrices de la paleta de `GL_OES_matrix_palette`.
+pub const MAX_PALETTE_MATRICES: usize = raster::FAST_PALETTE_SIZE;
+/// Matrices que se pueden mezclar en un vértice.
+pub const MAX_VERTEX_UNITS: usize = 4;
+/// Memoria que puede ocupar la geometría retenida, si no se cambia con
+/// [`set_retained_budget`].
+pub const RETAINED_BUDGET: usize = 8 << 20;
 
 #[derive(Clone, Copy)]
 pub struct Light {
@@ -48,13 +55,67 @@ pub struct Array {
     pub size: i32,
     pub kind: GLenum,
     pub stride: i32,
+    /// Puntero a los datos o, si `buffer` no es 0, desplazamiento dentro de
+    /// ese objeto de búfer.
     pub pointer: *const u8,
+    /// Objeto de búfer enlazado cuando se definió el array (0 = ninguno).
+    pub buffer: GLuint,
 }
 
 pub const ARRAY_VERTEX: usize = 0;
 pub const ARRAY_NORMAL: usize = 1;
 pub const ARRAY_COLOR: usize = 2;
 pub const ARRAY_TEXCOORD: usize = 3;
+pub const ARRAY_MATRIX_INDEX: usize = 4;
+pub const ARRAY_WEIGHT: usize = 5;
+pub const ARRAYS: usize = 6;
+
+/// Un objeto de búfer (`glBufferData`).
+pub struct Buffer {
+    pub data: Vec<u8>,
+    pub usage: GLenum,
+}
+
+/// Lo que identifica una geometría retenida: una llamada de dibujo sobre
+/// objetos de búfer, con todo lo que decide qué vértices se leen y cómo.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RetainKey {
+    pub mode: GLenum,
+    pub count: usize,
+    /// Primer vértice (`glDrawArrays`) o desplazamiento de los índices.
+    pub start: usize,
+    /// Búfer y tipo de los índices; 0 con `glDrawArrays`.
+    pub index_buffer: GLuint,
+    pub index_kind: GLenum,
+    /// De cada array que interviene: (búfer, desplazamiento, tamaño, tipo,
+    /// separación). Los que no intervienen, a cero.
+    pub arrays: [(GLuint, usize, i32, GLenum, i32); ARRAYS],
+    pub lighting: bool,
+    pub const_color: bool,
+    pub units: u8,
+}
+
+impl RetainKey {
+    pub fn uses(&self, buffer: GLuint) -> bool {
+        self.index_buffer == buffer || self.arrays.iter().any(|a| a.0 == buffer)
+    }
+}
+
+/// Estado que entra en los vértices retenidos sin venir de un búfer: normal
+/// (3) y coordenadas de textura (4) actuales, si no hay array, y la matriz
+/// de textura (16).
+pub type RetainInputs = [f32; 23];
+
+pub struct Retained {
+    /// Identificador en el rasterizador; `None` si ya no se retiene porque
+    /// sus entradas cambian a cada momento.
+    pub id: Option<u32>,
+    pub inputs: RetainInputs,
+    pub bytes: usize,
+    pub last_used: u64,
+    /// Veces que hubo que rehacerla por cambiar sus entradas.
+    pub rebuilds: u8,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Level {
@@ -111,7 +172,24 @@ pub struct Context {
     pub color: [f32; 4],
     pub normal: [f32; 3],
     pub texcoord: [f32; 4],
-    pub arrays: [Array; 4],
+    pub arrays: [Array; ARRAYS],
+
+    /// `GL_OES_matrix_palette`: cada matriz es una pila de un solo nivel.
+    pub matrix_palette: bool,
+    pub palette: Vec<Vec<Mat4>>,
+    pub current_palette: usize,
+
+    pub buffers: BTreeMap<GLuint, Buffer>,
+    pub array_buffer: GLuint,
+    pub element_buffer: GLuint,
+    pub next_buffer: GLuint,
+    /// Geometría retenida en el rasterizador, por llamada de dibujo.
+    pub retained: BTreeMap<RetainKey, Retained>,
+    pub retained_bytes: usize,
+    pub retained_budget: usize,
+    pub retained_clock: u64,
+    /// Triángulos dibujados desde geometría retenida.
+    pub retained_triangles: u64,
 
     pub lighting: bool,
     pub lights: [Light; MAX_LIGHTS],
@@ -189,7 +267,7 @@ impl Context {
         }
         inert_caps.insert(GL_DITHER, true);
         inert_caps.insert(GL_MULTISAMPLE, true);
-        let array = |size, kind| Array { enabled: false, size, kind, stride: 0, pointer: core::ptr::null() };
+        let array = |size, kind| Array { enabled: false, size, kind, stride: 0, pointer: core::ptr::null(), buffer: 0 };
         Context {
             raster,
             error: GL_NO_ERROR,
@@ -202,7 +280,19 @@ impl Context {
             color: [1.0; 4],
             normal: [0.0, 0.0, 1.0],
             texcoord: [0.0, 0.0, 0.0, 1.0],
-            arrays: [array(4, GL_FLOAT), array(3, GL_FLOAT), array(4, GL_FLOAT), array(4, GL_FLOAT)],
+            arrays: [array(4, GL_FLOAT), array(3, GL_FLOAT), array(4, GL_FLOAT), array(4, GL_FLOAT), array(0, GL_UNSIGNED_BYTE), array(0, GL_FLOAT)],
+            matrix_palette: false,
+            palette: vec![vec![IDENTITY]; MAX_PALETTE_MATRICES],
+            current_palette: 0,
+            buffers: BTreeMap::new(),
+            array_buffer: 0,
+            element_buffer: 0,
+            next_buffer: 1,
+            retained: BTreeMap::new(),
+            retained_bytes: 0,
+            retained_budget: RETAINED_BUDGET,
+            retained_clock: 0,
+            retained_triangles: 0,
             lighting: false,
             lights,
             material: Material {
@@ -269,6 +359,7 @@ impl Context {
         match self.matrix_mode {
             GL_PROJECTION => (&mut self.projection, PROJECTION_DEPTH),
             GL_TEXTURE => (&mut self.texture_matrix, TEXTURE_DEPTH),
+            GL_MATRIX_PALETTE_OES => (&mut self.palette[self.current_palette], 1),
             _ => (&mut self.modelview, MODELVIEW_DEPTH),
         }
     }
@@ -294,9 +385,45 @@ impl Context {
             GL_NORMALIZE => &mut self.normalize,
             GL_RESCALE_NORMAL => &mut self.rescale_normal,
             GL_POLYGON_OFFSET_FILL => &mut self.polygon_offset_fill,
+            GL_MATRIX_PALETTE_OES => &mut self.matrix_palette,
             GL_LIGHT0..=GL_LIGHT7 => &mut self.lights[(cap - GL_LIGHT0) as usize].enabled,
             _ => return self.inert_caps.get_mut(&cap),
         })
+    }
+
+    /// Suelta la geometría retenida que salió del objeto de búfer `buffer`
+    /// (porque cambia su contenido o se borra).
+    pub fn forget_buffer(&mut self, buffer: GLuint) {
+        let stale: Vec<RetainKey> = self.retained.keys().filter(|k| k.uses(buffer)).copied().collect();
+        for key in stale {
+            self.forget(&key);
+        }
+    }
+
+    /// Suelta una geometría retenida.
+    pub fn forget(&mut self, key: &RetainKey) {
+        if let Some(entry) = self.retained.remove(key) {
+            if let Some(id) = entry.id {
+                self.raster.fast_release(id);
+                self.retained_bytes -= entry.bytes;
+            }
+        }
+    }
+
+    /// Hace sitio para `bytes` más de geometría retenida, soltando la que
+    /// lleva más tiempo sin dibujarse. Devuelve `false` si no cabe.
+    pub fn make_room(&mut self, bytes: usize) -> bool {
+        if bytes > self.retained_budget {
+            return false;
+        }
+        while self.retained_bytes + bytes > self.retained_budget {
+            let oldest = self.retained.iter().filter(|(_, e)| e.id.is_some()).min_by_key(|(_, e)| e.last_used).map(|(k, _)| *k);
+            match oldest {
+                Some(key) => self.forget(&key),
+                None => return false,
+            }
+        }
+        true
     }
 
     /// Rectángulo de recorte en coordenadas del rasterizador (origen arriba),
@@ -369,4 +496,26 @@ pub(crate) fn set_current(context: *mut Context) {
 /// camino normal.
 pub fn fast_triangles() -> u64 {
     current().map_or(0, |c| c.raster.fast_triangle_count())
+}
+
+/// Triángulos dibujados desde geometría retenida (la de los objetos de búfer
+/// `GL_STATIC_DRAW`, cuyos vértices no se vuelven a leer) desde que se creó
+/// el contexto actual. No es parte de OpenGL ES.
+pub fn retained_triangles() -> u64 {
+    current().map_or(0, |c| c.retained_triangles)
+}
+
+/// Memoria que ocupa ahora la geometría retenida del contexto actual.
+pub fn retained_bytes() -> usize {
+    current().map_or(0, |c| c.retained_bytes)
+}
+
+/// Cambia el límite de memoria de la geometría retenida del contexto actual
+/// (8 MiB de entrada). Al llegar al límite se suelta la que lleva más tiempo
+/// sin dibujarse; con 0 no se retiene nada.
+pub fn set_retained_budget(bytes: usize) {
+    if let Some(c) = current() {
+        c.retained_budget = bytes;
+        c.make_room(0);
+    }
 }

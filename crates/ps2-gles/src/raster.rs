@@ -186,9 +186,24 @@ pub trait Rasterizer {
     /// los pide a `fill`, que rellena en orden los trozos que se le pasan
     /// (cada uno con un número de vértices múltiplo de 3). Devuelve `false`,
     /// sin llamar a `fill` ni dibujar nada, si no puede.
-    fn fast_triangles(&mut self, _setup: &FastSetup, _count: usize, _fill: &mut dyn FnMut(&mut [FastVertex])) -> bool {
+    fn fast_triangles(&mut self, _setup: &FastSetup, _count: usize, _fill: &mut dyn FnMut(&mut [f32])) -> bool {
         false
     }
+    /// Geometría retenida: guarda `count / 3` triángulos en el formato del
+    /// camino rápido (con `units` matrices por vértice, 0 = sin *skinning*)
+    /// para dibujarlos después cuantas veces haga falta sin volver a leer
+    /// los vértices. Devuelve su identificador, o `None` si el rasterizador
+    /// no retiene geometría (entonces no llama a `fill`).
+    fn fast_retain(&mut self, _units: usize, _count: usize, _fill: &mut dyn FnMut(&mut [f32])) -> Option<u32> {
+        None
+    }
+    /// Dibuja geometría retenida con el estado de `set_state` y las
+    /// constantes de `setup`. Devuelve `false`, sin dibujar, si no puede.
+    fn fast_retained(&mut self, _setup: &FastSetup, _id: u32) -> bool {
+        false
+    }
+    /// Libera geometría retenida.
+    fn fast_release(&mut self, _id: u32) {}
     /// Triángulos dibujados por el camino rápido desde el arranque.
     fn fast_triangle_count(&self) -> u64 {
         0
@@ -214,7 +229,7 @@ pub struct FastLight {
 /// puede resolver entera el rasterizador (en la PS2, la unidad vectorial
 /// VU1): transformación, iluminación, niebla, recorte y descarte de caras.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FastSetup {
+pub struct FastSetup<'a> {
     /// Proyección · modelview, por columnas.
     pub mvp: [f32; 16],
     /// Modelview (afín), por columnas.
@@ -238,8 +253,31 @@ pub struct FastSetup {
     pub cull: f32,
     /// Sombreado plano: manda el color del tercer vértice.
     pub flat: bool,
+    /// Proyección sola, por columnas (para el *skinning*).
+    pub projection: [f32; 16],
+    /// *Skinning*: matrices que se mezclan por vértice (de 1 a 4), o 0 si
+    /// todos los vértices usan la modelview.
+    pub skin: usize,
+    /// Paleta de matrices del *skinning* (modelviews afines, por columnas).
+    pub palette: &'a [[f32; 16]],
+    /// Color común a todos los vértices; entonces se ignora el de cada uno.
+    pub const_color: Option<[f32; 4]>,
 }
 
-/// Vértice de entrada del camino rápido: posición (x, y, z) y `s`; normal
-/// (x, y, z) y `t`; color (r, g, b, a).
-pub type FastVertex = [f32; 12];
+/// Matrices de la paleta del camino rápido.
+pub const FAST_PALETTE_SIZE: usize = 32;
+/// Los índices de matriz de un vértice van codificados como enteros:
+/// `FAST_PALETTE_BASE + 4 · índice` (su dirección en la memoria de la VU1).
+pub const FAST_PALETTE_BASE: u32 = 64;
+
+/// Números de coma flotante por vértice de entrada del camino rápido:
+/// posición (x, y, z) y `s`; normal (x, y, z) y `t`; color (r, g, b, a). Con
+/// *skinning* siguen cuatro pesos y cuatro índices de matriz codificados (los
+/// bits de un entero, ver [`FAST_PALETTE_BASE`]).
+pub const fn fast_vertex_floats(units: usize) -> usize {
+    if units > 0 {
+        20
+    } else {
+        12
+    }
+}

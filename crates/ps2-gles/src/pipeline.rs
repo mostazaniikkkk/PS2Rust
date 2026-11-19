@@ -93,6 +93,10 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
 fn normalize3(v: [f32; 3]) -> [f32; 3] {
     let len2 = dot3(v, v);
     if len2 <= 0.0 {
@@ -100,6 +104,51 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
     }
     let k = 1.0 / math::sqrt(len2);
     [v[0] * k, v[1] * k, v[2] * k]
+}
+
+/// Índices de matriz y pesos del vértice `index` (`GL_OES_matrix_palette`).
+unsafe fn skin_of(arrays: &[Array; ARRAYS], index: usize) -> ([usize; 4], [f32; 4]) {
+    let i = fetch(&arrays[ARRAY_MATRIX_INDEX], index, false);
+    let w = fetch(&arrays[ARRAY_WEIGHT], index, false);
+    (i.map(|i| (i as usize).min(MAX_PALETTE_MATRICES - 1)), w)
+}
+
+/// Copia un vértice del camino rápido (de 12 o de 20 números) con tamaño
+/// conocido al compilar, que es mucho más rápido que una copia genérica.
+#[inline(always)]
+fn copy_vertex(to: &mut [f32], from: &[f32]) {
+    if let (Ok(to), Ok(from)) = (<&mut [f32; 12]>::try_from(&mut *to), <&[f32; 12]>::try_from(from)) {
+        *to = *from;
+    } else if let (Ok(to), Ok(from)) = (<&mut [f32; 20]>::try_from(to), <&[f32; 20]>::try_from(from)) {
+        *to = *from;
+    }
+}
+
+/// Rellena `out` con vértices de `N` números del camino rápido. Con `first`
+/// van seguidos desde ese índice y se leen directamente; si no, el vértice
+/// número `n` de la lista es el de índice `index_at(n) + lowest`, que se lee
+/// una sola vez y se guarda en `table`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn expand<const N: usize>(out: &mut [f32], first: Option<usize>, next: &mut usize, table: &mut [f32], known: &mut [bool], lowest: usize, index_at: impl Fn(usize) -> usize, read: impl Fn(usize, &mut [f32])) {
+    let (slots, _) = out.as_chunks_mut::<N>();
+    if let Some(first) = first {
+        for (i, slot) in slots.iter_mut().enumerate() {
+            read(first + i, slot);
+        }
+        *next += slots.len();
+        return;
+    }
+    let (cache, _) = table.as_chunks_mut::<N>();
+    for slot in slots {
+        let at = index_at(*next);
+        *next += 1;
+        if !known[at] {
+            read(at + lowest, &mut cache[at]);
+            known[at] = true;
+        }
+        *slot = cache[at];
+    }
 }
 
 /// Matrices y datos que no cambian durante una llamada de dibujo.
@@ -178,10 +227,33 @@ impl Context {
         [clamp01(c[0]), clamp01(c[1]), clamp01(c[2]), clamp01(diffuse[3])]
     }
 
+    /// Matrices que se mezclan en cada vértice (`GL_OES_matrix_palette`), o 0
+    /// si todos usan la modelview.
+    fn skin_units(&self) -> usize {
+        let (indices, weights) = (&self.arrays[ARRAY_MATRIX_INDEX], &self.arrays[ARRAY_WEIGHT]);
+        if self.matrix_palette && indices.enabled && weights.enabled {
+            indices.size.min(weights.size).max(0) as usize
+        } else {
+            0
+        }
+    }
+
     /// Transforma e ilumina el vértice `index` de los arrays.
     unsafe fn process(&self, f: &Frame, index: usize) -> ClipVertex {
         let object = fetch(&self.arrays[ARRAY_VERTEX], index, false);
-        let eye = math::transform(&f.modelview, object);
+        let units = self.skin_units();
+        // Con paleta, la modelview del vértice es la mezcla de las suyas.
+        let mut blended = [0.0f32; 16];
+        if units > 0 {
+            let (indices, weights) = skin_of(&self.arrays, index);
+            for u in 0..units {
+                let matrix = &self.palette[indices[u]][0];
+                for (b, m) in blended.iter_mut().zip(matrix) {
+                    *b += weights[u] * m;
+                }
+            }
+        }
+        let eye = math::transform(if units > 0 { &blended } else { &f.modelview }, object);
         let clip = math::transform(&f.projection, eye);
         let color = if self.arrays[ARRAY_COLOR].enabled { fetch(&self.arrays[ARRAY_COLOR], index, true) } else { self.color };
         let (color, back) = if self.lighting {
@@ -192,16 +264,22 @@ impl Context {
                 self.normal
             };
             // Las normales se transforman con la traspuesta de la inversa.
-            let i = &f.inverse;
-            let mut n = [
-                n[0] * i[0] + n[1] * i[1] + n[2] * i[2],
-                n[0] * i[4] + n[1] * i[5] + n[2] * i[6],
-                n[0] * i[8] + n[1] * i[9] + n[2] * i[10],
-            ];
-            if self.rescale_normal {
+            let mut n = if units > 0 {
+                // La de la matriz mezclada: cofactores entre determinante.
+                let column = |k: usize| [blended[k * 4], blended[k * 4 + 1], blended[k * 4 + 2]];
+                let x = [cross(column(1), column(2)), cross(column(2), column(0)), cross(column(0), column(1))];
+                let det = dot3(column(0), x[0]);
+                let k = if det != 0.0 { 1.0 / det } else { 1.0 };
+                [0, 1, 2].map(|j| (x[0][j] * n[0] + x[1][j] * n[1] + x[2][j] * n[2]) * k)
+            } else {
+                let i = &f.inverse;
+                [n[0] * i[0] + n[1] * i[1] + n[2] * i[2], n[0] * i[4] + n[1] * i[5] + n[2] * i[6], n[0] * i[8] + n[1] * i[9] + n[2] * i[10]]
+            };
+            if self.rescale_normal && units == 0 {
                 n = [n[0] * f.rescale, n[1] * f.rescale, n[2] * f.rescale];
             }
-            if self.normalize {
+            // Con paleta no hay una escala única: reescalar es normalizar.
+            if self.normalize || (self.rescale_normal && units > 0) {
                 n = normalize3(n);
             }
             let front = self.light(eye, n, color);
@@ -416,17 +494,25 @@ impl Context {
     /// rasterizador no sepa hacer por su cuenta (en la PS2, la VU1), se le
     /// entregan los vértices sin transformar y él hace toda la geometría.
     /// Devuelve `false` si hay que seguir por el camino normal.
-    unsafe fn draw_fast(&mut self, mode: GLenum, count: usize, first: Option<usize>, index_of: &dyn Fn(usize) -> usize, frame: &Frame, state: &raster::State) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_fast(&mut self, mode: GLenum, count: usize, first: Option<usize>, index_of: &dyn Fn(usize) -> usize, source: Option<(GLuint, GLenum, usize)>, offsets: &[Array; ARRAYS], frame: &Frame, state: &raster::State) -> bool {
         if !matches!(mode, GL_TRIANGLES | GL_TRIANGLE_STRIP | GL_TRIANGLE_FAN) || count < 3 {
             return false;
         }
         if self.arrays[ARRAY_VERTEX].size > 3 || (self.polygon_offset_fill && self.polygon_offset != [0.0, 0.0]) {
             return false;
         }
-        let mv = &frame.modelview;
-        let affine = mv[3] == 0.0 && mv[7] == 0.0 && mv[11] == 0.0 && mv[15] == 1.0;
+        let units = self.skin_units();
+        let is_affine = |m: &Mat4| m[3] == 0.0 && m[7] == 0.0 && m[11] == 0.0 && m[15] == 1.0;
+        let affine = if units > 0 { self.palette.iter().all(|m| is_affine(&m[0])) } else { is_affine(&frame.modelview) };
         if (self.lighting || self.fog) && !affine {
             return false;
+        }
+        let mut palette = [math::IDENTITY; MAX_PALETTE_MATRICES];
+        if units > 0 {
+            for (slot, matrix) in palette.iter_mut().zip(&self.palette) {
+                *slot = matrix[0];
+            }
         }
         if self.fog && (self.fog_mode != GL_LINEAR || self.fog_end == self.fog_start) {
             return false;
@@ -461,6 +547,13 @@ impl Context {
             }
         };
         let color_material = self.color_material;
+        // Color igual para todos los vértices: con luces, si el color del
+        // vértice no hace de material; sin ellas, si no hay array de colores.
+        let const_color = match (self.lighting, color_material, self.arrays[ARRAY_COLOR].enabled) {
+            (true, false, _) => Some([1.0, 1.0, 1.0, material.diffuse[3]]),
+            (_, _, false) => Some(self.color),
+            _ => None,
+        };
         let times = |a: [f32; 4], b: [f32; 4]| [a[0] * b[0], a[1] * b[1], a[2] * b[2]];
         let rgb = |a: [f32; 4]| [a[0], a[1], a[2]];
         let mut lights = [raster::FastLight::default(); 8];
@@ -489,7 +582,7 @@ impl Context {
             viewport: self.viewport,
             depth_range: self.depth_range,
             lighting: self.lighting,
-            normalize: self.normalize,
+            normalize: self.normalize || (self.rescale_normal && units > 0),
             lights,
             light_count,
             base: if self.lighting { rgb(material.emission) } else { [0.0; 3] },
@@ -501,59 +594,66 @@ impl Context {
             fog: self.fog.then(|| (self.fog_end, 1.0 / (self.fog_end - self.fog_start))),
             cull,
             flat: !self.smooth,
+            projection: frame.projection,
+            skin: units,
+            palette: &palette[..if units > 0 { MAX_PALETTE_MATRICES } else { 0 }],
+            const_color,
         };
-        // Lee un vértice de los arrays, tal cual.
-        let read = |index: usize| -> raster::FastVertex {
-            let p = fetch(&self.arrays[ARRAY_VERTEX], index, false);
-            let c = if self.arrays[ARRAY_COLOR].enabled { fetch(&self.arrays[ARRAY_COLOR], index, true) } else { self.color };
-            let n = match (self.lighting, self.arrays[ARRAY_NORMAL].enabled) {
+        let floats = raster::fast_vertex_floats(units);
+        // Lee un vértice de los arrays, tal cual. (Con copias del estado que
+        // necesita, para no retener el contexto mientras se dibuja.)
+        let (arrays, lighting, current_normal, current_texcoord) = (self.arrays, self.lighting, self.normal, self.texcoord);
+        let read = |index: usize, out: &mut [f32]| {
+            let p = fetch(&arrays[ARRAY_VERTEX], index, false);
+            let n = match (lighting, arrays[ARRAY_NORMAL].enabled) {
                 (false, _) => [0.0; 4],
-                (true, true) => fetch(&self.arrays[ARRAY_NORMAL], index, true),
-                (true, false) => [self.normal[0], self.normal[1], self.normal[2], 0.0],
+                (true, true) => fetch(&arrays[ARRAY_NORMAL], index, true),
+                (true, false) => [current_normal[0], current_normal[1], current_normal[2], 0.0],
             };
-            let mut tc = if self.arrays[ARRAY_TEXCOORD].enabled { fetch(&self.arrays[ARRAY_TEXCOORD], index, false) } else { self.texcoord };
+            let mut tc = if arrays[ARRAY_TEXCOORD].enabled { fetch(&arrays[ARRAY_TEXCOORD], index, false) } else { current_texcoord };
             if !frame.texture_identity {
                 tc = math::transform(&frame.texture, tc);
             }
             let (s, t) = if tc[3] != 1.0 && tc[3] != 0.0 { (tc[0] / tc[3], tc[1] / tc[3]) } else { (tc[0], tc[1]) };
-            // Con luces, el color del vértice sólo cuenta si hace de material.
-            let color = match (self.lighting, color_material) {
-                (false, _) | (true, true) => c,
-                (true, false) => [1.0, 1.0, 1.0, material.diffuse[3]],
-            };
-            [p[0], p[1], p[2], s, n[0], n[1], n[2], t, color[0], color[1], color[2], color[3]]
+            let color = if const_color.is_some() { [0.0; 4] } else { fetch(&arrays[ARRAY_COLOR], index, true) };
+            copy_vertex(&mut out[..12], &[p[0], p[1], p[2], s, n[0], n[1], n[2], t, color[0], color[1], color[2], color[3]]);
+            if units > 0 {
+                let (indices, weights) = skin_of(&arrays, index);
+                for u in 0..4 {
+                    // Las matrices que no se usan, con peso 0.
+                    out[12 + u] = if u < units { weights[u] } else { 0.0 };
+                    let matrix = if u < units { indices[u] } else { 0 };
+                    out[16 + u] = f32::from_bits(raster::FAST_PALETTE_BASE + 4 * matrix as u32);
+                }
+            }
         };
         // Triángulos sueltos sin índices: cada vértice se usa una vez y va
         // directo. Si no, cada vértice se lee una sola vez y se guarda.
         let direct = first.filter(|_| mode == GL_TRIANGLES);
-        let (mut table, mut known, mut lowest) = (Vec::new(), Vec::new(), 0);
-        if direct.is_none() {
-            let (mut low, mut high) = (usize::MAX, 0);
-            for position in 0..count {
-                let index = index_of(position);
-                low = low.min(index);
-                high = high.max(index);
-            }
-            lowest = low;
-            table = alloc::vec![[0.0f32; 12]; high - low + 1];
-            known = alloc::vec![false; high - low + 1];
-        }
+        let (mut table, mut known, mut lowest): (Vec<f32>, Vec<bool>, usize) = (Vec::new(), Vec::new(), 0);
         let total = match mode {
             GL_TRIANGLES => count / 3 * 3,
             _ => (count - 2) * 3,
         };
         // Vértice número `n` de la lista de triángulos sueltos.
         let mut next = 0;
-        let mut fill = |out: &mut [raster::FastVertex]| {
-            for slot in out.iter_mut() {
-                let (triangle, corner) = (next / 3, next % 3);
-                next += 1;
-                if let Some(first) = direct {
-                    *slot = read(first + triangle * 3 + corner);
-                    continue;
+        let mut fill = |out: &mut [f32]| {
+            if direct.is_none() && known.is_empty() {
+                let (mut low, mut high) = (usize::MAX, 0);
+                for position in 0..count {
+                    let index = index_of(position);
+                    low = low.min(index);
+                    high = high.max(index);
                 }
+                lowest = low;
+                table = alloc::vec![0.0f32; (high - low + 1) * floats];
+                known = alloc::vec![false; high - low + 1];
+            }
+            // Índice (menos `lowest`) del vértice `n` de la lista de triángulos.
+            let index_at = |n: usize| {
+                let (triangle, corner) = (n / 3, n % 3);
                 let position = match mode {
-                    GL_TRIANGLES => triangle * 3 + corner,
+                    GL_TRIANGLES => n,
                     // Los triángulos impares de una tira van al revés para
                     // conservar la orientación.
                     GL_TRIANGLE_STRIP => match (corner, triangle % 2) {
@@ -563,14 +663,44 @@ impl Context {
                     },
                     _ => [0, triangle + 1, triangle + 2][corner],
                 };
-                let index = index_of(position);
-                if !known[index - lowest] {
-                    table[index - lowest] = read(index);
-                    known[index - lowest] = true;
-                }
-                *slot = table[index - lowest];
+                index_of(position) - lowest
+            };
+            let first = direct.map(|first| first + next);
+            if floats == 12 {
+                expand::<12>(out, first, &mut next, &mut table, &mut known, lowest, index_at, &read);
+            } else {
+                expand::<20>(out, first, &mut next, &mut table, &mut known, lowest, index_at, &read);
             }
         };
+        // Geometría retenida: si todo sale de objetos de búfer que no
+        // cambian (`GL_STATIC_DRAW`), los vértices se leen una sola vez.
+        let retain_key = (|| {
+            let mut arrays = [(0, 0, 0, 0, 0); ARRAYS];
+            let used = [true, self.lighting, const_color.is_none(), true, units > 0, units > 0];
+            for (i, array) in offsets.iter().enumerate() {
+                if !used[i] || !array.enabled {
+                    continue;
+                }
+                if self.buffers.get(&array.buffer)?.usage != GL_STATIC_DRAW {
+                    return None;
+                }
+                arrays[i] = (array.buffer, array.pointer as usize, array.size, array.kind, array.stride);
+            }
+            let (index_buffer, index_kind, start) = match (first, source) {
+                (Some(first), _) => (0, 0, first),
+                (None, Some((buffer, kind, offset))) if self.buffers.get(&buffer)?.usage == GL_STATIC_DRAW => (buffer, kind, offset),
+                _ => return None,
+            };
+            Some(RetainKey { mode, count, start, index_buffer, index_kind, arrays, lighting: self.lighting, const_color: const_color.is_some(), units: units as u8 })
+        })();
+        let mut inputs: RetainInputs = [0.0; 23];
+        if self.lighting && !self.arrays[ARRAY_NORMAL].enabled {
+            inputs[..3].copy_from_slice(&self.normal);
+        }
+        if !self.arrays[ARRAY_TEXCOORD].enabled {
+            inputs[3..7].copy_from_slice(&self.texcoord);
+        }
+        inputs[7..].copy_from_slice(&frame.texture);
         // El recorte en x e y lo hace el rasterizador con su rectángulo de
         // recorte: debe ser, como mucho, el viewport.
         let (_, height) = self.raster.size();
@@ -580,6 +710,53 @@ impl Context {
         let (x1, y1) = ((vx + vw).min(window[2]), (height as i32 - vy).min(window[3]));
         let clipped = raster::State { scissor: Some([x0, y0, x1.max(x0), y1.max(y0)]), ..*state };
         self.raster.set_state(&clipped);
+        if let Some(key) = retain_key {
+            self.retained_clock += 1;
+            let clock = self.retained_clock;
+            // ¿Está ya retenida, con las mismas entradas?
+            let mut id = None;
+            let mut rebuilds = 0;
+            if let Some(entry) = self.retained.get_mut(&key) {
+                if entry.id.is_some() && entry.inputs == inputs {
+                    entry.last_used = clock;
+                    id = entry.id;
+                } else if entry.inputs != inputs {
+                    rebuilds = entry.rebuilds.saturating_add(1);
+                } else {
+                    // No cabía o se soltó: no cuenta como cambio.
+                    rebuilds = entry.rebuilds;
+                }
+            }
+            // Si sus entradas cambian a cada momento, no compensa retenerla.
+            let bytes = total * floats * 4;
+            if id.is_none() && rebuilds <= 3 {
+                self.forget(&key);
+                if self.make_room(bytes) {
+                    id = self.raster.fast_retain(units, total, &mut fill);
+                }
+                if id.is_some() {
+                    self.retained_bytes += bytes;
+                }
+                if id.is_some() || rebuilds > 0 {
+                    self.retained.insert(key, Retained { id, inputs, bytes, last_used: clock, rebuilds });
+                }
+            } else if id.is_none() {
+                if let Some(entry) = self.retained.get_mut(&key) {
+                    if let Some(old) = entry.id.take() {
+                        self.raster.fast_release(old);
+                        self.retained_bytes -= entry.bytes;
+                    }
+                }
+            }
+            if let Some(id) = id {
+                if self.raster.fast_retained(&setup, id) {
+                    self.retained_triangles += (total / 3) as u64;
+                    return true;
+                }
+                self.raster.set_state(state);
+                return false;
+            }
+        }
         if self.raster.fast_triangles(&setup, total, &mut fill) {
             return true;
         }
@@ -589,14 +766,30 @@ impl Context {
 
     /// Dibuja `count` vértices cuyos índices da `index_of`. `first` es el
     /// primer índice cuando van seguidos (`glDrawArrays`).
-    pub unsafe fn draw(&mut self, mode: GLenum, count: usize, first: Option<usize>, index_of: &dyn Fn(usize) -> usize) {
-        if !self.arrays[ARRAY_VERTEX].enabled || self.arrays[ARRAY_VERTEX].pointer.is_null() || count == 0 {
+    /// `source` dice de qué objeto de búfer salen los índices, si salen de
+    /// uno: (búfer, tipo, desplazamiento).
+    pub unsafe fn draw(&mut self, mode: GLenum, count: usize, first: Option<usize>, index_of: &dyn Fn(usize) -> usize, source: Option<(GLuint, GLenum, usize)>) {
+        // Los arrays que viven en objetos de búfer guardan un desplazamiento:
+        // mientras se dibuja, se cambia por el puntero de verdad.
+        let offsets = self.arrays;
+        for array in self.arrays.iter_mut().filter(|a| a.buffer != 0) {
+            array.pointer = match self.buffers.get(&array.buffer) {
+                Some(buffer) if (array.pointer as usize) < buffer.data.len() => buffer.data.as_ptr().add(array.pointer as usize),
+                _ => core::ptr::null(),
+            };
+        }
+        self.draw_arrays(mode, count, first, index_of, source, &offsets);
+        self.arrays = offsets;
+    }
+
+    unsafe fn draw_arrays(&mut self, mode: GLenum, count: usize, first: Option<usize>, index_of: &dyn Fn(usize) -> usize, source: Option<(GLuint, GLenum, usize)>, offsets: &[Array; ARRAYS]) {
+        if !self.arrays[ARRAY_VERTEX].enabled || count == 0 || self.arrays.iter().any(|a| a.enabled && a.pointer.is_null()) {
             return;
         }
         let state = self.raster_state();
         self.raster.set_state(&state);
         let frame = self.frame();
-        if self.draw_fast(mode, count, first, index_of, &frame, &state) {
+        if self.draw_fast(mode, count, first, index_of, source, offsets, &frame, &state) {
             return;
         }
         // Con índices, cada vértice se transforma e ilumina una sola vez.

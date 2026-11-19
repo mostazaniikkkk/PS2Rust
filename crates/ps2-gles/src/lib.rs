@@ -30,6 +30,13 @@
 //! focos, niebla exponencial, puntos y líneas) lo calcula el Emotion Engine. Lo que el GS no puede
 //! hacer está documentado en [`gs`](crate::gs) y en el README.
 //!
+//! Además de OpenGL ES 1.0 están los objetos de búfer de 1.1
+//! (`glBufferData`…) y `GL_OES_matrix_palette`. Lo que se dibuja desde
+//! búferes `GL_STATIC_DRAW` queda retenido: sus vértices se preparan una vez
+//! y después el DMA los reenvía a la VU1 sin que la CPU los toque
+//! ([`retained_triangles`], [`set_retained_budget`]). Las mallas con paleta
+//! de matrices se deforman en la propia VU1.
+//!
 //! El crate también compila en el PC, con un rasterizador por software que
 //! sigue la especificación: es la referencia contra la que se comprueba la
 //! PS2.
@@ -66,6 +73,6 @@ mod vutests;
 
 pub use api::*;
 pub use consts::*;
-pub use context::fast_triangles;
+pub use context::{fast_triangles, retained_bytes, retained_triangles, set_retained_budget};
 pub use egl::*;
 pub use fixed::*;

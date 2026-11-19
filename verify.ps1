@@ -57,7 +57,7 @@ Step 'Pruebas unitarias del legalizador R5900' {
     $code -eq 0
 }
 
-Step 'Pruebas unitarias de ps2-gles en el PC (nucleo de GL, referencia y microprograma de la VU1 interpretado)' {
+Step 'Pruebas unitarias de ps2-gles en el PC (nucleo de GL, referencia, microprograma de la VU1 interpretado, geometria retenida y paleta de matrices)' {
     $code = Run 'test --release -p ps2-gles' "$out\gles-unit.txt" "$out\gles-unit.err"
     Get-Content "$out\gles-unit.txt" | Select-String 'test result' | Select-Object -First 1 | ForEach-Object { Write-Host "  $_" }
     $code -eq 0
@@ -169,7 +169,7 @@ Step 'OpenGL ES 1.0: demo con texturas, luces, niebla y mezcla (captura)' {
     $code = Run "ps2 run -p gles-demo --timeout 120 --until `"frames en`" --screenshot `"$out\gles-demo.png`"" "$out\gles-demo.txt" "$out\gles-demo.err"
     $text = Get-Content "$out\gles-demo.txt" -Raw
     Get-Content "$out\gles-demo.txt" | ForEach-Object { Write-Host "  $_" }
-    ($code -eq 0) -and ($text -match 'OpenGL ES-CM 1\.0') -and ($text -match '[1-9]\d{4,} triangulos por la VU1') -and ($text -match '300 frames en \d+ ms, glGetError\(\) = 0x0') -and (Test-Path "$out\gles-demo.png")
+    ($code -eq 0) -and ($text -match 'OpenGL ES-CM 1\.0') -and ($text -match '[1-9]\d{4,} triangulos por la VU1') -and ($text -match '[1-9]\d{4,} de ellos desde geometria retenida') -and ($text -match '\d{6,} por segundo con paleta de matrices') -and ($text -match '300 frames en \d+ ms, glGetError\(\) = 0x0') -and (Test-Path "$out\gles-demo.png")
 }
 
 Step 'Red: std::net, HTTP y WebSocket en la PS2, identicos al PC contra el mismo servidor' {

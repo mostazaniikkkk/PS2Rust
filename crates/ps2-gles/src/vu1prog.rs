@@ -16,7 +16,7 @@
 //! sin iluminación no hay código de luces, cada luz lleva el código de su
 //! tipo, etc. Así dentro no hay ni una comprobación de modo.
 
-use crate::raster::FastSetup;
+use crate::raster::{FastSetup, FAST_PALETTE_BASE, FAST_PALETTE_SIZE};
 use crate::vu::*;
 use alloc::vec::Vec;
 
@@ -38,14 +38,22 @@ pub const C_TEX1: usize = 21;
 pub const C_PLANES: usize = 22;
 pub const C_LIGHTS: usize = 28;
 pub const C_LOD: usize = 60;
+/// Color de todos los vértices, cuando no lo trae cada uno.
+pub const C_COLOR: usize = 62;
 /// Fin de las constantes de una llamada de dibujo.
-pub const CONSTANTS: usize = 62;
+pub const CONSTANTS: usize = 63;
 /// Enteros de cada tanda: (triángulos, 0x8000, 0, 0).
-pub const C_COUNT: usize = 62;
+pub const C_COUNT: usize = 63;
 /// Vértices de entrada: tres palabras por vértice.
 pub const INPUT: usize = 64;
 /// Triángulos por tanda.
 pub const BATCH: usize = 40;
+/// Paleta de matrices (cuatro palabras cada una), sólo con *skinning*.
+pub const PALETTE: usize = FAST_PALETTE_BASE as usize;
+/// Con *skinning* los vértices van detrás de la paleta, con cinco palabras
+/// cada uno (se añaden los pesos y las direcciones de sus matrices).
+pub const SKIN_INPUT: usize = PALETTE + FAST_PALETTE_SIZE * 4;
+pub const SKIN_BATCH: usize = 15;
 const WORK: usize = INPUT + BATCH * 9;
 const CLIP_A: usize = WORK + 12;
 const CLIP_B: usize = CLIP_A + 30;
@@ -69,6 +77,11 @@ pub struct Key {
     pub lod: bool,
     /// Sin descarte de caras (sólo se quitan los triángulos sin área).
     pub no_cull: bool,
+    /// Matrices que se mezclan por vértice (*skinning*); 0 = ninguna, la
+    /// modelview de siempre.
+    pub skin: u8,
+    /// El color es el mismo para todos los vértices (está en [`C_COLOR`]).
+    pub const_color: bool,
 }
 
 /// Lo que el rasterizador sabe y el núcleo de GL no.
@@ -105,6 +118,35 @@ impl Key {
             flat: setup.flat,
             lod: target.lod.is_some(),
             no_cull: setup.cull == 0.0,
+            skin: setup.skin as u8,
+            const_color: setup.const_color.is_some(),
+        }
+    }
+
+    /// Dirección del primer vértice de entrada.
+    pub fn input(&self) -> usize {
+        if self.skin > 0 {
+            SKIN_INPUT
+        } else {
+            INPUT
+        }
+    }
+
+    /// Triángulos por tanda.
+    pub fn batch(&self) -> usize {
+        if self.skin > 0 {
+            SKIN_BATCH
+        } else {
+            BATCH
+        }
+    }
+
+    /// Palabras de 128 bits por vértice de entrada.
+    pub fn vertex_words(&self) -> usize {
+        if self.skin > 0 {
+            5
+        } else {
+            3
         }
     }
 
@@ -184,7 +226,7 @@ pub fn build(key: &Key) -> Vec<u64> {
     a.u(sub(XYZW, ZERO, 0, 0));
     a.l(ilw(X, TRIS, C_COUNT as i32, 0));
     a.l(ilw(Y, EOP, C_COUNT as i32, 0));
-    a.l(iaddiu(IN, 0, INPUT as u32));
+    a.l(iaddiu(IN, 0, key.input() as u32));
     a.l(iaddiu(OUT_BASE, 0, OUT_A as u32));
     // Paquete de salida vacío: su etiqueta y nada más.
     a.l(lq(XYZW, 11, C_TAG as i32, 0));
@@ -300,16 +342,57 @@ pub fn build(key: &Key) -> Vec<u64> {
     let (pos, normal, color, clip, stf, eye) = (11, 12, 13, 14, 15, 20);
     a.l(lq(XYZW, pos, 0, IN));
     a.l(lq(XYZW, normal, 1, IN));
-    a.l(lq(XYZW, color, 2, IN));
-    a.u(mulabc(XYZW, MVP, pos, BX));
-    a.u(maddabc(XYZW, MVP + 1, pos, BY));
-    a.u(maddabc(XYZW, MVP + 2, pos, BZ));
-    a.u(maddbc(XYZW, clip, MVP + 3, 0, BW));
+    if key.const_color {
+        a.l(lq(XYZW, color, C_COLOR as i32, 0));
+    } else {
+        a.l(lq(XYZW, color, 2, IN));
+    }
+    // Columnas de la matriz mezclada del vértice (sólo con *skinning*).
+    let column = [25, 26, 27, 28];
+    let units = key.skin as usize;
+    if units > 0 {
+        let (weights, indices) = (29, 30);
+        let address = [FLAG, PA, PB, PC];
+        a.l(lq(XYZW, weights, 3, IN));
+        a.l(lq(XYZW, indices, 4, IN));
+        for u in 0..units {
+            a.l(mtir(address[u], indices, u as u32));
+        }
+        // matriz = Σ peso · matriz de la paleta, columna a columna.
+        for (c, &dst) in column.iter().enumerate() {
+            for u in 0..units {
+                a.l(lq(XYZW, 16 + u as u32, c as i32, address[u]));
+            }
+            for u in 0..units {
+                let (m, bc) = (16 + u as u32, u as u32);
+                match (u == 0, u == units - 1) {
+                    (true, true) => a.u(mulbc(XYZW, dst, m, weights, bc)),
+                    (true, false) => a.u(mulabc(XYZW, m, weights, bc)),
+                    (false, false) => a.u(maddabc(XYZW, m, weights, bc)),
+                    (false, true) => a.u(maddbc(XYZW, dst, m, weights, bc)),
+                }
+            }
+        }
+        // ojo = matriz · (x, y, z, 1); recorte = proyección · ojo.
+        a.u(mulabc(XYZW, column[0], pos, BX));
+        a.u(maddabc(XYZW, column[1], pos, BY));
+        a.u(maddabc(XYZW, column[2], pos, BZ));
+        a.u(maddbc(XYZW, eye, column[3], 0, BW));
+        a.u(mulabc(XYZW, MVP, eye, BX));
+        a.u(maddabc(XYZW, MVP + 1, eye, BY));
+        a.u(maddabc(XYZW, MVP + 2, eye, BZ));
+        a.u(maddbc(XYZW, clip, MVP + 3, eye, BW));
+    } else {
+        a.u(mulabc(XYZW, MVP, pos, BX));
+        a.u(maddabc(XYZW, MVP + 1, pos, BY));
+        a.u(maddabc(XYZW, MVP + 2, pos, BZ));
+        a.u(maddbc(XYZW, clip, MVP + 3, 0, BW));
+    }
     // s y t viajan en el cuarto componente de la posición y de la normal.
     a.u(addbc(X, stf, ZERO, pos, BW));
     a.u(addbc(Y, stf, ZERO, normal, BW));
     a.u(addbc(Z, stf, ZERO, MISC, BW));
-    if key.needs_eye() {
+    if key.needs_eye() && units == 0 {
         for i in 0..4 {
             a.l(lq(XYZW, 16 + i, (C_MODELVIEW + i as usize) as i32, 0));
         }
@@ -331,8 +414,24 @@ pub fn build(key: &Key) -> Vec<u64> {
     }
     if key.lighting {
         let (n, acc, t) = (23, 24, 28);
-        for i in 0..3 {
-            a.l(lq(XYZW, 16 + i, (C_NORMAL + i as usize) as i32, 0));
+        if units > 0 {
+            // La normal va con la traspuesta de la inversa de la matriz
+            // mezclada: sus cofactores (productos vectoriales de las
+            // columnas) divididos por el determinante.
+            for (i, (x, y)) in [(1, 2), (2, 0), (0, 1)].into_iter().enumerate() {
+                a.u(opmula(column[x], column[y]));
+                a.u(opmsub(16 + i as u32, column[y], column[x]));
+            }
+            dot3(&mut a, 19, column[0], 16);
+            a.l(div(0, BW, 19, BX));
+            a.l(WAITQ);
+            a.u(mulq(XYZ, 16, 16));
+            a.u(mulq(XYZ, 17, 17));
+            a.u(mulq(XYZ, 18, 18));
+        } else {
+            for i in 0..3 {
+                a.l(lq(XYZW, 16 + i, (C_NORMAL + i as usize) as i32, 0));
+            }
         }
         a.u(mulabc(XYZ, 16, normal, BX));
         a.u(maddabc(XYZ, 17, normal, BY));
@@ -394,7 +493,7 @@ pub fn build(key: &Key) -> Vec<u64> {
     // Prueba de recorte, con x e y a escala de la banda de guarda.
     a.u(mul(XYZW, 16, clip, GUARD));
     a.u(clipw(16, 16));
-    a.l(iaddiu(IN, IN, 3));
+    a.l(iaddiu(IN, IN, key.vertex_words() as u32));
     a.l(iaddiu(WORK_PTR, WORK_PTR, 3));
     a.ret(AUX);
 
@@ -567,8 +666,11 @@ fn floats(v: [f32; 4]) -> [u32; 4] {
 /// Las constantes de una llamada de dibujo, listas para la memoria de la VU1.
 pub fn constants(setup: &FastSetup, target: &Target) -> [[u32; 4]; CONSTANTS] {
     let mut c = [[0u32; 4]; CONSTANTS];
+    // Con *skinning* la modelview la pone cada vértice: aquí va la proyección.
+    let mvp = if setup.skin > 0 { &setup.projection } else { &setup.mvp };
+    c[C_COLOR] = floats(setup.const_color.unwrap_or([0.0; 4]));
     for i in 0..4 {
-        c[C_MVP + i] = floats([setup.mvp[i * 4], setup.mvp[i * 4 + 1], setup.mvp[i * 4 + 2], setup.mvp[i * 4 + 3]]);
+        c[C_MVP + i] = floats([mvp[i * 4], mvp[i * 4 + 1], mvp[i * 4 + 2], mvp[i * 4 + 3]]);
         c[C_MODELVIEW + i] = floats([setup.modelview[i * 4], setup.modelview[i * 4 + 1], setup.modelview[i * 4 + 2], setup.modelview[i * 4 + 3]]);
     }
     for i in 0..3 {
@@ -630,6 +732,17 @@ pub fn constants(setup: &FastSetup, target: &Target) -> [[u32; 4]; CONSTANTS] {
     c[C_LOD] = floats([3.999, 0.75, 1.999, 0.5]);
     c[C_LOD + 1] = floats([1.3465, 0.3465, 1.0 / 16.0, 7.0]);
     c
+}
+
+/// La paleta de matrices de una llamada con *skinning*, para [`PALETTE`].
+pub fn palette(setup: &FastSetup) -> [[u32; 4]; FAST_PALETTE_SIZE * 4] {
+    let mut words = [[0u32; 4]; FAST_PALETTE_SIZE * 4];
+    for (i, matrix) in setup.palette.iter().take(FAST_PALETTE_SIZE).enumerate() {
+        for column in 0..4 {
+            words[i * 4 + column] = floats([matrix[column * 4], matrix[column * 4 + 1], matrix[column * 4 + 2], matrix[column * 4 + 3]]);
+        }
+    }
+    words
 }
 
 /// Los enteros de una tanda de `triangles` triángulos.

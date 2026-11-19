@@ -151,6 +151,8 @@ pub fn run(out: &mut dyn Write) -> u32 {
     mipmaps(&mut t);
     lighting(&mut t);
     fog(&mut t);
+    buffers(&mut t);
+    matrix_palette(&mut t);
     reading(&mut t);
     fixed_point(&mut t);
     presenting(&mut t, display, surface);
@@ -1049,6 +1051,300 @@ fn fog(t: &mut T) {
     glFogf(GL_FOG_DENSITY, -1.0);
     t.error("densidad negativa", GL_INVALID_VALUE);
     glDisable(GL_FOG);
+}
+
+fn int(name: GLenum) -> GLint {
+    let mut v = [0; 16];
+    unsafe { glGetIntegerv(name, v.as_mut_ptr()) };
+    v[0]
+}
+
+/// Cuadrado de 20×20 con una esquina en el origen, como abanico.
+const SQUARE: [f32; 12] = [0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 20.0, 20.0, 0.0, 0.0, 20.0, 0.0];
+
+/// Objetos de búfer (los de OpenGL ES 1.1). Los `GL_STATIC_DRAW` quedan
+/// retenidos en el rasterizador: se dibujan varias veces y se cambian para
+/// comprobar que siempre sale lo que hay en el búfer.
+fn buffers(t: &mut T) {
+    t.section("objetos de bufer");
+    pixel_projection();
+    clear_black();
+    let mut names = [0u32; 6];
+    // Dibuja lo que haya en los arrays en la casilla `slot`.
+    let place = |slot: i32| {
+        glLoadIdentity();
+        glTranslatef(20.0 + 40.0 * slot as f32, 20.0, 0.0);
+    };
+    unsafe {
+        glBindBuffer(0x1234, 1);
+        t.error("glBindBuffer con destino desconocido: GL_INVALID_ENUM", GL_INVALID_ENUM);
+        glBufferData(GL_ARRAY_BUFFER, 4, null(), GL_STATIC_DRAW);
+        t.error("glBufferData sin bufer enlazado: GL_INVALID_OPERATION", GL_INVALID_OPERATION);
+        glGenBuffers(6, names.as_mut_ptr());
+        t.check("glGenBuffers da nombres nuevos", names.iter().all(|n| *n != 0) && names[0] != names[1]);
+        t.check("un nombre sin enlazar todavia no es un bufer", glIsBuffer(names[0]) == GL_FALSE);
+        glBindBuffer(GL_ARRAY_BUFFER, names[0]);
+        t.check("enlazado, si", glIsBuffer(names[0]) == GL_TRUE && int(GL_ARRAY_BUFFER_BINDING) == names[0] as i32);
+        glBufferData(GL_ARRAY_BUFFER, 4, null(), 0x1234);
+        t.error("uso desconocido: GL_INVALID_ENUM", GL_INVALID_ENUM);
+        glBufferData(GL_ARRAY_BUFFER, 48, SQUARE.as_ptr().cast(), GL_STATIC_DRAW);
+        let mut v = [0; 2];
+        glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &mut v[0]);
+        glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_USAGE, &mut v[1]);
+        t.check("GL_BUFFER_SIZE y GL_BUFFER_USAGE", v == [48, GL_STATIC_DRAW as i32]);
+        glBufferSubData(GL_ARRAY_BUFFER, 40, 12, SQUARE.as_ptr().cast());
+        t.error("glBufferSubData fuera del bufer: GL_INVALID_VALUE", GL_INVALID_VALUE);
+
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glVertexPointer(3, GL_FLOAT, 0, null());
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        t.check("el array recuerda su bufer", int(GL_VERTEX_ARRAY_BUFFER_BINDING) == names[0] as i32 && int(GL_ARRAY_BUFFER_BINDING) == 0);
+        // El mismo búfer, tres veces, con otra matriz y otro color.
+        for (slot, color) in [RED, GREEN, BLUE].into_iter().enumerate() {
+            place(slot as i32);
+            glColor4f(color[0] as f32 / 255.0, color[1] as f32 / 255.0, color[2] as f32 / 255.0, 1.0);
+            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        }
+        t.rgb("bufer estatico dibujado", 30, 30, RED, 2);
+        t.rgb("otra vez, con otra matriz y otro color", 70, 30, GREEN, 2);
+        t.rgb("y otra", 110, 30, BLUE, 2);
+        glColor4f(1.0, 1.0, 1.0, 1.0);
+
+        // Índices en un búfer: el puntero es un desplazamiento.
+        let indices: [u16; 9] = [0, 1, 2, 0, 2, 3, 0, 1, 2];
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, names[1]);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, 18, indices.as_ptr().cast(), GL_STATIC_DRAW);
+        place(3);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, null());
+        t.rgb("indices en un bufer", 145, 35, WHITE, 2);
+        t.rgb("los dos triangulos", 155, 25, WHITE, 2);
+        place(4);
+        glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, 12 as *const GLvoid);
+        t.rgb("indices desde un desplazamiento: un triangulo", 195, 25, WHITE, 2);
+        t.rgb("y solo uno", 185, 35, BLACK, 2);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 12 as *const GLvoid);
+        t.error("indices mas alla del bufer: GL_INVALID_OPERATION", GL_INVALID_OPERATION);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+
+        // Cambiar el contenido: lo siguiente se dibuja con lo nuevo.
+        let mut raised = SQUARE;
+        for y in raised.iter_mut().skip(1).step_by(3) {
+            *y += 40.0;
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, names[0]);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, 48, raised.as_ptr().cast());
+        place(0);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        t.rgb("glBufferSubData: el cuadrado se dibuja mas arriba", 30, 70, WHITE, 2);
+        t.rgb("y no donde estaba", 30, 50, BLACK, 2);
+        glBufferData(GL_ARRAY_BUFFER, 48, SQUARE.as_ptr().cast(), GL_STATIC_DRAW);
+        place(5);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        t.rgb("glBufferData de nuevo: vuelve abajo", 230, 30, WHITE, 2);
+        t.rgb("y no arriba", 230, 70, BLACK, 2);
+
+        // Un búfer con posiciones y colores intercalados.
+        let mut mixed = [0u8; 64];
+        for (i, vertex) in mixed.chunks_mut(16).enumerate() {
+            for k in 0..3 {
+                vertex[k * 4..k * 4 + 4].copy_from_slice(&SQUARE[i * 3 + k].to_le_bytes());
+            }
+            vertex[12..].copy_from_slice(&[255, 128, 0, 255]);
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, names[2]);
+        glBufferData(GL_ARRAY_BUFFER, 64, mixed.as_ptr().cast(), GL_STATIC_DRAW);
+        glVertexPointer(3, GL_FLOAT, 16, null());
+        glColorPointer(4, GL_UNSIGNED_BYTE, 16, 12 as *const GLvoid);
+        glEnableClientState(GL_COLOR_ARRAY);
+        place(6);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        t.rgb("posiciones y colores intercalados en un bufer", 270, 30, [255, 128, 0], 2);
+
+        // Posiciones en un búfer y colores en memoria del programa.
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        let colors = [0.0f32, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0];
+        glColorPointer(4, GL_FLOAT, 0, colors.as_ptr().cast());
+        place(7);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        t.rgb("bufer y array del programa a la vez", 310, 30, [0, 255, 255], 2);
+        glDisableClientState(GL_COLOR_ARRAY);
+
+        // Un búfer que cambia a menudo.
+        glBindBuffer(GL_ARRAY_BUFFER, names[3]);
+        glBufferData(GL_ARRAY_BUFFER, 48, null(), GL_DYNAMIC_DRAW);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, 48, SQUARE.as_ptr().cast());
+        glVertexPointer(3, GL_FLOAT, 0, null());
+        place(8);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        t.rgb("bufer GL_DYNAMIC_DRAW", 350, 30, WHITE, 2);
+
+        // Borrado: deja de existir y sus arrays no dibujan nada.
+        glDeleteBuffers(6, names.as_ptr());
+        t.check("glDeleteBuffers", glIsBuffer(names[3]) == GL_FALSE && int(GL_ARRAY_BUFFER_BINDING) == 0);
+        place(9);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        t.rgb("un array de un bufer borrado no dibuja", 390, 30, BLACK, 2);
+        glLoadIdentity();
+    }
+    t.error("objetos de bufer sin errores", GL_NO_ERROR);
+}
+
+/// Matriz `index` de la paleta: traslación y escala en z.
+fn bone(index: GLuint, x: f32, y: f32, scale_z: f32) {
+    glCurrentPaletteMatrixOES(index);
+    glLoadIdentity();
+    glTranslatef(x, y, 0.0);
+    glScalef(1.0, 1.0, scale_z);
+}
+
+/// El cuadrado de 20×20, con dos matrices por vértice.
+fn skinned_square(matrices: &[u8; 8], weights: &[f32; 8]) {
+    unsafe {
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glVertexPointer(3, GL_FLOAT, 0, SQUARE.as_ptr().cast());
+        glMatrixIndexPointerOES(2, GL_UNSIGNED_BYTE, 0, matrices.as_ptr().cast());
+        glWeightPointerOES(2, GL_FLOAT, 0, weights.as_ptr().cast());
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    }
+}
+
+/// `GL_OES_matrix_palette`: cada vértice mezcla matrices de una paleta.
+fn matrix_palette(t: &mut T) {
+    t.section("paleta de matrices");
+    pixel_projection();
+    clear_black();
+    let extensions = unsafe { core::ffi::CStr::from_ptr(glGetString(GL_EXTENSIONS).cast()) };
+    t.check("GL_OES_matrix_palette anunciada", extensions.to_bytes().windows(21).any(|w| w == b"GL_OES_matrix_palette"));
+    t.check("GL_MAX_PALETTE_MATRICES_OES >= 9", int(GL_MAX_PALETTE_MATRICES_OES) >= 9);
+    t.check("GL_MAX_VERTEX_UNITS_OES >= 3", int(GL_MAX_VERTEX_UNITS_OES) >= 3);
+    glCurrentPaletteMatrixOES(1000);
+    t.error("matriz fuera de la paleta: GL_INVALID_VALUE", GL_INVALID_VALUE);
+    unsafe { glMatrixIndexPointerOES(9, GL_UNSIGNED_BYTE, 0, null()) };
+    t.error("demasiadas matrices por vertice: GL_INVALID_VALUE", GL_INVALID_VALUE);
+    unsafe { glWeightPointerOES(2, GL_UNSIGNED_BYTE, 0, null()) };
+    t.error("pesos de tipo entero: GL_INVALID_ENUM", GL_INVALID_ENUM);
+    glMatrixMode(GL_MATRIX_PALETTE_OES);
+    t.error("glMatrixMode(GL_MATRIX_PALETTE_OES)", GL_NO_ERROR);
+    glCurrentPaletteMatrixOES(3);
+    t.check("GL_CURRENT_PALETTE_MATRIX_OES", int(GL_CURRENT_PALETTE_MATRIX_OES) == 3);
+    glPushMatrix();
+    t.error("las matrices de la paleta no tienen pila: GL_STACK_OVERFLOW", GL_STACK_OVERFLOW);
+
+    bone(0, 20.0, 20.0, 1.0);
+    bone(1, 140.0, 20.0, 1.0);
+    glEnable(GL_MATRIX_PALETTE_OES);
+    glEnableClientState(GL_MATRIX_INDEX_ARRAY_OES);
+    glEnableClientState(GL_WEIGHT_ARRAY_OES);
+    let whole = [1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+    glColor4f(1.0, 0.0, 0.0, 1.0);
+    skinned_square(&[0; 8], &whole);
+    t.rgb("todos los vertices con la matriz 0", 30, 30, RED, 2);
+    glColor4f(0.0, 1.0, 0.0, 1.0);
+    skinned_square(&[1; 8], &whole);
+    t.rgb("con la matriz 1", 150, 30, GREEN, 2);
+    t.rgb("y solo ahi", 100, 30, BLACK, 2);
+    // A medias entre las dos: el cuadrado queda en medio.
+    clear_black();
+    glColor4f(0.0, 0.0, 1.0, 1.0);
+    skinned_square(&[0, 1, 0, 1, 0, 1, 0, 1], &[0.5; 8]);
+    t.rgb("mitad de cada matriz: en medio", 90, 30, BLUE, 2);
+    t.rgb("y no en los extremos", 30, 30, BLACK, 2);
+    t.rgb("ni en el otro", 150, 30, BLACK, 2);
+    // Los vértices de la izquierda con una y los de la derecha con otra: se estira.
+    clear_black();
+    glColor4f(1.0, 1.0, 1.0, 1.0);
+    skinned_square(&[0, 0, 1, 0, 1, 0, 0, 0], &whole);
+    t.rgb("un lado con cada matriz: se estira (izquierda)", 25, 30, WHITE, 2);
+    t.rgb("centro", 90, 30, WHITE, 2);
+    t.rgb("derecha", 155, 30, WHITE, 2);
+    t.rgb("y acaba donde debe", 165, 30, BLACK, 2);
+    // El segundo peso manda sobre la segunda matriz.
+    clear_black();
+    skinned_square(&[0, 1, 0, 1, 0, 1, 0, 1], &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+    t.rgb("peso entero en la segunda matriz", 150, 30, WHITE, 2);
+    t.rgb("nada en la primera", 30, 30, BLACK, 2);
+    // glLoadPaletteFromModelViewMatrixOES.
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glTranslatef(300.0, 200.0, 0.0);
+    glCurrentPaletteMatrixOES(2);
+    glLoadPaletteFromModelViewMatrixOES();
+    glLoadIdentity();
+    skinned_square(&[2; 8], &whole);
+    t.rgb("glLoadPaletteFromModelViewMatrixOES", 310, 210, WHITE, 2);
+    // Sin GL_MATRIX_PALETTE_OES manda la modelview, aunque haya arrays.
+    glDisable(GL_MATRIX_PALETTE_OES);
+    glTranslatef(400.0, 300.0, 0.0);
+    skinned_square(&[2; 8], &whole);
+    t.rgb("desactivada, manda la modelview", 410, 310, WHITE, 2);
+    glLoadIdentity();
+    glEnable(GL_MATRIX_PALETTE_OES);
+
+    // Normales: van con la traspuesta de la inversa de la matriz mezclada.
+    clear_black();
+    glEnable(GL_LIGHTING);
+    glEnable(GL_LIGHT0);
+    glNormal3f(0.0, 0.0, 1.0);
+    glMatrixMode(GL_MATRIX_PALETTE_OES);
+    bone(1, 60.0, 20.0, 2.0);
+    bone(2, 100.0, 20.0, 1.0);
+    bone(3, 100.0, 20.0, 2.0);
+    skinned_square(&[0; 8], &whole);
+    t.rgb("luz con paleta: 0,2*0,2 + 0,8", 30, 30, [214, 214, 214], 4);
+    skinned_square(&[1; 8], &whole);
+    t.rgb("matriz con escala 2 en z: normal a la mitad", 70, 30, [112, 112, 112], 4);
+    skinned_square(&[2, 3, 2, 3, 2, 3, 2, 3], &[0.5; 8]);
+    t.rgb("mezcla de escalas 1 y 2: normal a 1/1,5", 110, 30, [146, 146, 146], 4);
+    glEnable(GL_NORMALIZE);
+    bone(1, 140.0, 20.0, 2.0);
+    skinned_square(&[1; 8], &whole);
+    t.rgb("GL_NORMALIZE con paleta", 150, 30, [214, 214, 214], 4);
+    glDisable(GL_NORMALIZE);
+    glEnable(GL_RESCALE_NORMAL);
+    bone(1, 180.0, 20.0, 2.0);
+    skinned_square(&[1; 8], &whole);
+    t.rgb("GL_RESCALE_NORMAL con paleta", 190, 30, [214, 214, 214], 4);
+    glDisable(GL_RESCALE_NORMAL);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_LIGHT0);
+
+    // Malla en búferes y paleta que cambia: lo que hace una animación.
+    clear_black();
+    let mut names = [0u32; 3];
+    let matrices = [0u8, 0, 1, 0, 1, 0, 0, 0];
+    unsafe {
+        glGenBuffers(3, names.as_mut_ptr());
+        glBindBuffer(GL_ARRAY_BUFFER, names[0]);
+        glBufferData(GL_ARRAY_BUFFER, 48, SQUARE.as_ptr().cast(), GL_STATIC_DRAW);
+        glVertexPointer(3, GL_FLOAT, 0, null());
+        glBindBuffer(GL_ARRAY_BUFFER, names[1]);
+        glBufferData(GL_ARRAY_BUFFER, 8, matrices.as_ptr().cast(), GL_STATIC_DRAW);
+        glMatrixIndexPointerOES(2, GL_UNSIGNED_BYTE, 0, null());
+        glBindBuffer(GL_ARRAY_BUFFER, names[2]);
+        glBufferData(GL_ARRAY_BUFFER, 32, whole.as_ptr().cast(), GL_STATIC_DRAW);
+        glWeightPointerOES(2, GL_FLOAT, 0, null());
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        for step in 0..3 {
+            let y = 20.0 + 40.0 * step as f32;
+            bone(0, 20.0, y, 1.0);
+            bone(1, 60.0 + 40.0 * step as f32, y, 1.0);
+            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        }
+        t.rgb("malla en buferes, primera pose", 75, 30, WHITE, 2);
+        t.rgb("no llega mas lejos", 85, 30, BLACK, 2);
+        t.rgb("segunda pose, mas estirada", 115, 70, WHITE, 2);
+        t.rgb("hasta su sitio", 125, 70, BLACK, 2);
+        t.rgb("tercera pose", 155, 110, WHITE, 2);
+        t.rgb("hasta el suyo", 165, 110, BLACK, 2);
+        glDeleteBuffers(3, names.as_ptr());
+    }
+    glDisableClientState(GL_MATRIX_INDEX_ARRAY_OES);
+    glDisableClientState(GL_WEIGHT_ARRAY_OES);
+    glDisable(GL_MATRIX_PALETTE_OES);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    t.error("paleta de matrices sin errores", GL_NO_ERROR);
 }
 
 fn reading(t: &mut T) {
