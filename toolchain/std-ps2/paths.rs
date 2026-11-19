@@ -29,6 +29,12 @@ fn initial_dir() -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes[..end.max(colon + 1)].to_vec()))
 }
 
+/// Carpeta del ejecutable, terminada de forma que se le puede añadir un
+/// nombre de archivo.
+pub fn exe_dir() -> PathBuf {
+    initial_dir()
+}
+
 pub fn getcwd() -> io::Result<PathBuf> {
     let mut cwd = CWD.lock().unwrap();
     Ok(cwd.get_or_insert_with(initial_dir).clone())

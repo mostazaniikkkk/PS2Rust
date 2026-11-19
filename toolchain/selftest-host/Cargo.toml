@@ -8,5 +8,6 @@ description = "Ejecuta la batería de pruebas en el PC para obtener la salida de
 
 [dependencies]
 ps2-gles = { path = "../../crates/ps2-gles" }
+ps2-web = { path = "../../crates/ps2-web" }
 
 [workspace]

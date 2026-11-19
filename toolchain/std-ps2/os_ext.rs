@@ -104,3 +104,58 @@ impl SifRpcClient {
         crate::sys::os::sif::call(&mut self.inner, fno, send, send_size, recv, recv_size)
     }
 }
+
+/// Configuración de la interfaz de red.
+#[stable(feature = "rust1", since = "1.0.0")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkInfo {
+    /// Dirección MAC del adaptador.
+    #[stable(feature = "rust1", since = "1.0.0")]
+    pub mac: [u8; 6],
+    #[stable(feature = "rust1", since = "1.0.0")]
+    pub ip: crate::net::Ipv4Addr,
+    #[stable(feature = "rust1", since = "1.0.0")]
+    pub netmask: crate::net::Ipv4Addr,
+    #[stable(feature = "rust1", since = "1.0.0")]
+    pub gateway: crate::net::Ipv4Addr,
+    /// Servidores de DNS (el segundo puede ser 0.0.0.0).
+    #[stable(feature = "rust1", since = "1.0.0")]
+    pub dns: [crate::net::Ipv4Addr; 2],
+}
+
+/// Arranca la red si hace falta (carga `ps2net.irx` de la carpeta del
+/// ejecutable y pide dirección por DHCP, hasta 15 s) y devuelve su
+/// configuración. `std::net` lo hace solo al primer uso; esta función sirve
+/// para saber la dirección o para adelantar la espera.
+#[stable(feature = "rust1", since = "1.0.0")]
+pub fn network_info() -> io::Result<NetworkInfo> {
+    let (mac, a) = crate::sys::net::ps2_network_info()?;
+    Ok(NetworkInfo { mac, ip: a[0], netmask: a[1], gateway: a[2], dns: [a[3], a[4]] })
+}
+
+/// Fija la dirección de la interfaz a mano, sin DHCP (por ejemplo con un
+/// cable directo a un PC). Hay que llamarla antes de usar la red.
+#[stable(feature = "rust1", since = "1.0.0")]
+pub fn set_network_config(ip: crate::net::Ipv4Addr, netmask: crate::net::Ipv4Addr, gateway: crate::net::Ipv4Addr, dns: crate::net::Ipv4Addr) -> io::Result<()> {
+    crate::sys::net::ps2_network_configure(ip, netmask, gateway, dns)
+}
+
+/// Carpeta del ejecutable, lista para añadirle un nombre de archivo
+/// (`host:`, `mc0:/JUEGO/`, `cdrom0:\`…). Ahí se buscan los módulos del IOP
+/// que acompañan al programa.
+#[stable(feature = "rust1", since = "1.0.0")]
+pub fn exe_dir() -> crate::path::PathBuf {
+    crate::sys::paths::exe_dir()
+}
+
+/// Escribe a RAM e invalida la caché de datos del EE.
+///
+/// El IOP escribe en la memoria del EE por DMA, sin pasar por la caché. Un
+/// búfer que el IOP va a rellenar debe leerse por el espejo sin caché
+/// (`dirección | 0x2000_0000`), y conviene llamar a esto después de
+/// reservarlo y prepararlo para que no queden líneas de caché pendientes de
+/// escribirse encima.
+#[stable(feature = "rust1", since = "1.0.0")]
+pub fn flush_data_cache() {
+    crate::sys::os::kernel::flush_dcache();
+}

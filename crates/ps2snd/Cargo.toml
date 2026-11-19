@@ -1,0 +1,10 @@
+[package]
+name = "ps2snd"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+repository = "https://github.com/mostazaniikkkk/PS2Rust"
+description = "Módulo del IOP que reproduce sonido por el SPU2 de la PlayStation 2; lo usa el crate ps2-audio"
+
+[dependencies]
+ps2-iop = { path = "../ps2-iop" }

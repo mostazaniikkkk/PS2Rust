@@ -1,0 +1,10 @@
+[package]
+name = "ps2net"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+repository = "https://github.com/mostazaniikkkk/PS2Rust"
+description = "Módulo del IOP con el driver del adaptador de red de la PlayStation 2; lo usa std::net"
+
+[dependencies]
+ps2-iop = { path = "../ps2-iop" }

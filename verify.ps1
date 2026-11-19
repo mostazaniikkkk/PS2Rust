@@ -4,8 +4,12 @@
 #
 # Compila todo, ejecuta los programas en PCSX2 y comprueba los resultados.
 # Necesita PCSX2 con BIOS: -Emulator <pcsx2-qt.exe> o la variable PCSX2_EXE.
+#
+# Opcional: -PadEmulator <pcsx2-qt.exe> indica un PCSX2 con el mando 1 asignado
+# al teclado (ver examples/av-selftest/src/bin/pad-keys.rs) y anade la prueba de
+# cada boton y stick con teclas simuladas, que se envian solo a su ventana.
 
-param([string]$Emulator = $env:PCSX2_EXE)
+param([string]$Emulator = $env:PCSX2_EXE, [string]$PadEmulator = '')
 
 $ErrorActionPreference = 'Stop'
 if (-not $Emulator -or -not (Test-Path $Emulator)) {
@@ -53,16 +57,28 @@ Step 'Pruebas unitarias del legalizador R5900' {
     $code -eq 0
 }
 
-Step 'Pruebas unitarias de ps2-gles en el PC (nucleo de GL y rasterizador de referencia)' {
+Step 'Pruebas unitarias de ps2-gles en el PC (nucleo de GL, referencia y microprograma de la VU1 interpretado)' {
     $code = Run 'test --release -p ps2-gles' "$out\gles-unit.txt" "$out\gles-unit.err"
     Get-Content "$out\gles-unit.txt" | Select-String 'test result' | Select-Object -First 1 | ForEach-Object { Write-Host "  $_" }
     $code -eq 0
 }
 
-$examples = 'hello', 'selftest', 'cube', 'panic-demo', 'std-hello', 'std-selftest', 'std-panic', 'iop-demo', 'iop-selftest-runner', 'gles-selftest', 'gles-demo'
-$modules = 'rustiop', 'iop-selftest'
+Step 'Pruebas unitarias de ps2-audio y ps2-pad en el PC (ADPCM, remuestreo, datos del mando)' {
+    $code = Run 'test --release -p ps2-audio -p ps2-pad' "$out\av-unit.txt" "$out\av-unit.err"
+    Get-Content "$out\av-unit.txt" | Select-String 'test result: ok. [1-9]' | ForEach-Object { Write-Host "  $_" }
+    $code -eq 0
+}
 
-Step 'Compilar los once programas del EE (seis sin std, cinco con std)' {
+Step 'Pruebas unitarias de ps2-web en el PC (HTTP y WebSocket)' {
+    $code = Run 'test --release -p ps2-web' "$out\web-unit.txt" "$out\web-unit.err"
+    Get-Content "$out\web-unit.txt" | Select-String 'test result' | Select-Object -First 1 | ForEach-Object { Write-Host "  $_" }
+    $code -eq 0
+}
+
+$examples = 'hello', 'selftest', 'cube', 'panic-demo', 'std-hello', 'std-selftest', 'std-panic', 'iop-demo', 'iop-selftest-runner', 'gles-selftest', 'gles-demo', 'net-selftest', 'net-demo', 'av-selftest', 'av-demo'
+$modules = 'rustiop', 'iop-selftest', 'ps2net', 'ps2snd'
+
+Step 'Compilar los quince paquetes del EE (seis sin std, nueve con std)' {
     $ok = $true
     foreach ($p in $examples) {
         $code = Run "ps2 build -p $p" "$out\build-$p.txt" "$out\build-$p.err"
@@ -72,7 +88,7 @@ Step 'Compilar los once programas del EE (seis sin std, cinco con std)' {
     $ok
 }
 
-Step 'IOP: compilar los dos modulos IRX; reubicados como la BIOS, identicos al enlazador' {
+Step 'IOP: compilar los cuatro modulos IRX; reubicados como la BIOS, identicos al enlazador' {
     $ok = $true
     foreach ($p in $modules) {
         $code = Run "ps2 build --iop --verify-relocs -p $p" "$out\build-$p.txt" "$out\build-$p.err"
@@ -125,7 +141,23 @@ Step 'IOP: modulo en Rust sirviendo RPC a un programa del EE (captura)' {
     ($code -eq 0) -and ($text -match 'rustiop: Rust en el IOP') -and ($text -match 'strlen = 7') -and ($text -match 'demo IOP: 7/7 comprobaciones correctas') -and (Test-Path "$out\iop-demo.png")
 }
 
-Step 'OpenGL ES 1.0: bateria de pixeles en el GS identica a la referencia del PC' {
+Step 'OpenGL ES 1.0: la bateria, con el microprograma de la VU1 interpretado en el PC, da lo mismo' {
+    $tool = Join-Path $PSScriptRoot 'toolchain\selftest-host\target\release\selftest-host.exe'
+    $build = Run 'build --release -q --manifest-path toolchain\selftest-host\Cargo.toml' "$out\gles-host-build.txt" "$out\gles-host-build.err"
+    $plain = Start-Process -FilePath $tool -ArgumentList '--gles' -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$out\gles-pc.txt" -RedirectStandardError "$out\gles-pc.err"
+    $env:PS2_GLES_VU = '1'
+    try {
+        $vu = Start-Process -FilePath $tool -ArgumentList '--gles' -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$out\gles-pc-vu.txt" -RedirectStandardError "$out\gles-pc-vu.err"
+    } finally {
+        Remove-Item Env:PS2_GLES_VU
+    }
+    $diff = @(Compare-Object (Get-Content "$out\gles-pc.txt") (Get-Content "$out\gles-pc-vu.txt") -SyncWindow 0)
+    Get-Content "$out\gles-pc-vu.txt" | Select-Object -Last 1 | ForEach-Object { Write-Host "  $_" }
+    Write-Host "  diferencias con el camino normal: $($diff.Count)"
+    ($build -eq 0) -and ($plain.ExitCode -eq 0) -and ($vu.ExitCode -eq 0) -and ($diff.Count -eq 0)
+}
+
+Step 'OpenGL ES 1.0: bateria de pixeles (VU1 + GS) identica a la referencia del PC' {
     $hostCode = Run 'run --release -q --manifest-path toolchain\selftest-host\Cargo.toml -- --gles' "$out\gles-selftest.expected.txt" "$out\gles-selftest-host.err"
     $ps2Code = Run "ps2 run -p gles-selftest --timeout 240 --log `"$out\gles-selftest.actual.txt`"" "$out\gles-selftest.stdout.txt" "$out\gles-selftest.err"
     $same = SameOutput "$out\gles-selftest.expected.txt" "$out\gles-selftest.actual.txt"
@@ -137,7 +169,58 @@ Step 'OpenGL ES 1.0: demo con texturas, luces, niebla y mezcla (captura)' {
     $code = Run "ps2 run -p gles-demo --timeout 120 --until `"frames en`" --screenshot `"$out\gles-demo.png`"" "$out\gles-demo.txt" "$out\gles-demo.err"
     $text = Get-Content "$out\gles-demo.txt" -Raw
     Get-Content "$out\gles-demo.txt" | ForEach-Object { Write-Host "  $_" }
-    ($code -eq 0) -and ($text -match 'OpenGL ES-CM 1\.0') -and ($text -match '300 frames en \d+ ms, glGetError\(\) = 0x0') -and (Test-Path "$out\gles-demo.png")
+    ($code -eq 0) -and ($text -match 'OpenGL ES-CM 1\.0') -and ($text -match '[1-9]\d{4,} triangulos por la VU1') -and ($text -match '300 frames en \d+ ms, glGetError\(\) = 0x0') -and (Test-Path "$out\gles-demo.png")
+}
+
+Step 'Red: std::net, HTTP y WebSocket en la PS2, identicos al PC contra el mismo servidor' {
+    # Servidor de pruebas en el PC: solo escucha en 127.0.0.2 (bucle local).
+    $tool = Join-Path $PSScriptRoot 'toolchain\selftest-host\target\release\selftest-host.exe'
+    $build = Run 'build --release -q --manifest-path toolchain\selftest-host\Cargo.toml' "$out\net-host-build.txt" "$out\net-host-build.err"
+    Remove-Item "$out\net-test.cfg" -ErrorAction SilentlyContinue
+    $server = Start-Process -FilePath $tool -ArgumentList "--net-server `"$out`"" -WindowStyle Hidden -PassThru
+    try {
+        for ($i = 0; $i -lt 100 -and -not (Test-Path "$out\net-test.cfg"); $i++) { Start-Sleep -Milliseconds 100 }
+        $hostRun = Start-Process -FilePath $tool -ArgumentList "--net `"$out`"" -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$out\net-selftest.expected.txt" -RedirectStandardError "$out\net-selftest-host.err"
+        $ps2Code = Run "ps2 run -p net-selftest --timeout 300 --log `"$out\net-selftest.actual.txt`"" "$out\net-selftest.stdout.txt" "$out\net-selftest.err"
+        $same = SameOutput "$out\net-selftest.expected.txt" "$out\net-selftest.actual.txt"
+        Write-Host "  exit PC $($hostRun.ExitCode), PS2 $ps2Code"
+        ($build -eq 0) -and ($hostRun.ExitCode -eq 0) -and ($ps2Code -eq 0) -and $same
+    } finally {
+        Start-Process -FilePath $tool -ArgumentList "--net-stop `"$out`"" -NoNewWindow -Wait
+        if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Step 'Red: DHCP, DNS y una pagina de Internet por HTTP (captura)' {
+    $code = Run "ps2 run -p net-demo --timeout 120 --until `"pantalla lista`" --screenshot `"$out\net-demo.png`"" "$out\net-demo.txt" "$out\net-demo.err"
+    $text = Get-Content "$out\net-demo.txt" -Raw
+    Get-Content "$out\net-demo.txt" | ForEach-Object { Write-Host "  $_" }
+    ($code -eq 0) -and ($text -match 'HTTP 200') -and ($text -match 'demo de red: 6/6 correctas') -and (Test-Path "$out\net-demo.png")
+}
+
+Step 'Mando y sonido: modulos de la BIOS, DualShock, flujo PCM y voces ADPCM del SPU2' {
+    # Suenan tonos cortos y bajos.
+    $code = Run 'ps2 run -p av-selftest --bin av-selftest --timeout 180' "$out\av-selftest.txt" "$out\av-selftest.err"
+    $text = Get-Content "$out\av-selftest.txt" -Raw
+    Get-Content "$out\av-selftest.txt" | Select-String '^== |FALLO|se obtuvo' | ForEach-Object { Write-Host "  $_" }
+    ($code -eq 0) -and ($text -match 'resultado: 68 comprobaciones, 0 fallos')
+}
+
+if ($PadEmulator) {
+    Step 'Mando: cada boton y stick, con teclas simuladas (PCSX2 con el mando en el teclado)' {
+        $pad = (Resolve-Path $PadEmulator).Path
+        $code = Run "ps2 run -p av-selftest --bin pad-keys --keys --timeout 180 --emulator `"$pad`"" "$out\pad-keys.txt" "$out\pad-keys.err"
+        $text = Get-Content "$out\pad-keys.txt" -Raw
+        Get-Content "$out\pad-keys.txt" | Select-String '^== |FALLO|ultima lectura' | ForEach-Object { Write-Host "  $_" }
+        ($code -eq 0) -and ($text -match 'resultado: 51 comprobaciones, 0 fallos')
+    }
+}
+
+Step 'Mando y sonido: demo en pantalla (captura)' {
+    $code = Run "ps2 run -p av-demo --timeout 120 --until `"pantalla lista`" --screenshot `"$out\av-demo.png`"" "$out\av-demo.txt" "$out\av-demo.err"
+    $text = Get-Content "$out\av-demo.txt" -Raw
+    Get-Content "$out\av-demo.txt" | Select-String 'av-demo|ps2snd' | ForEach-Object { Write-Host "  $_" }
+    ($code -eq 0) -and ($text -match 'mando \(\w+\) y sonido listos') -and (Test-Path "$out\av-demo.png")
 }
 
 Step 'Panico: mensaje por consola y codigo de salida 101' {

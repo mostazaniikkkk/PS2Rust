@@ -75,6 +75,11 @@ fn new_rasterizer(window: EGLNativeWindowType, depth_bits: u32) -> Box<dyn Raste
 #[cfg(not(target_arch = "mips"))]
 fn new_rasterizer(window: EGLNativeWindowType, depth_bits: u32) -> Box<dyn Rasterizer> {
     let (w, h) = window_size(window).unwrap();
+    // Con PS2_GLES_VU=1 la geometría de los triángulos la hace el
+    // microprograma de la VU1, interpretado: así se prueba en el PC.
+    if std::env::var_os("PS2_GLES_VU").is_some() {
+        return Box::new(crate::vusoft::VuSoftRasterizer::new(w, h, depth_bits));
+    }
     Box::new(crate::soft::SoftRasterizer::new(w, h, depth_bits))
 }
 

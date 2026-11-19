@@ -8,6 +8,10 @@
 //!   pequeños), codificada, como `iop-selftest`.
 //! * `--gles`: la batería de OpenGL ES 1.0 (`gles-selftest`), con el
 //!   rasterizador por software de `ps2-gles` como referencia.
+//! * `--net-server <carpeta>`: servidor de pruebas de red en 127.0.0.2; deja
+//!   sus puertos en `<carpeta>/net-test.cfg`. `--net-stop <carpeta>` lo para.
+//! * `--net <carpeta>`: la batería de `std::net` (`net-selftest`) contra ese
+//!   servidor, codificada.
 //! * `--std`: `core`/`alloc` + std, codificada, como `std-selftest`.
 //!   Usa el directorio actual para las pruebas de archivos.
 
@@ -19,10 +23,38 @@ mod suite;
 mod std_suite;
 #[path = "../../../examples/gles-selftest/src/gl_suite.rs"]
 mod gl_suite;
+#[path = "../../../examples/net-selftest/src/net_suite.rs"]
+mod net_suite;
+#[path = "../../../examples/net-selftest/src/web_suite.rs"]
+mod web_suite;
+mod net_server;
+mod web_server;
 
 use std::fmt::Write as _;
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    // `--net-server <carpeta>`, `--net-stop <carpeta>` y `--net <carpeta>`.
+    if let Some(i) = args.iter().position(|a| a.starts_with("--net")) {
+        let directory = std::path::PathBuf::from(args.get(i + 1).map(String::as_str).unwrap_or("."));
+        match args[i].as_str() {
+            "--net-server" => net_server::run(&directory),
+            "--net-stop" => net_server::stop(&directory),
+            _ => {
+                let text = std::fs::read_to_string(directory.join("net-test.cfg")).expect("falta net-test.cfg: arranca antes --net-server");
+                let config = net_suite::Config::parse(&text).expect("net-test.cfg no vale");
+                let (mut out, mut failed) = net_suite::run(&config);
+                let (web_out, web_failed) = web_suite::run(&config);
+                out.push_str(&web_out);
+                failed += web_failed;
+                let mut escaped = String::new();
+                let _ = suite::Escaped(&mut escaped).write_str(&out);
+                print!("{escaped}");
+                std::process::exit(failed as i32);
+            }
+        }
+        return;
+    }
     if std::env::args().any(|a| a == "--gles") {
         let mut out = String::new();
         let failed = gl_suite::run(&mut out);

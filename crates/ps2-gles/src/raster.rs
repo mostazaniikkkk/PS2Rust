@@ -181,4 +181,65 @@ pub trait Rasterizer {
     fn finish(&mut self);
     /// Presenta el frame y pasa a dibujar en el otro búfer.
     fn swap(&mut self);
+    /// Camino rápido: dibuja `count / 3` triángulos con el estado de
+    /// `set_state`, haciendo el rasterizador toda la geometría. Los vértices
+    /// los pide a `fill`, que rellena en orden los trozos que se le pasan
+    /// (cada uno con un número de vértices múltiplo de 3). Devuelve `false`,
+    /// sin llamar a `fill` ni dibujar nada, si no puede.
+    fn fast_triangles(&mut self, _setup: &FastSetup, _count: usize, _fill: &mut dyn FnMut(&mut [FastVertex])) -> bool {
+        false
+    }
+    /// Triángulos dibujados por el camino rápido desde el arranque.
+    fn fast_triangle_count(&self) -> u64 {
+        0
+    }
 }
+
+/// Una luz para el camino rápido: direccional o puntual, sin foco.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FastLight {
+    /// Dirección hacia la luz (unitaria) o, si es puntual, su posición; en
+    /// coordenadas de ojo.
+    pub vector: [f32; 3],
+    pub positional: bool,
+    /// Términos ambiente y difuso, ya multiplicados por el material (o sin
+    /// multiplicar, si el material es el color del vértice).
+    pub ambient: [f32; 3],
+    pub diffuse: [f32; 3],
+    /// Atenuación constante, lineal y cuadrática (sólo puntuales).
+    pub attenuation: [f32; 3],
+}
+
+/// Todo lo que es constante durante una llamada de dibujo de triángulos que
+/// puede resolver entera el rasterizador (en la PS2, la unidad vectorial
+/// VU1): transformación, iluminación, niebla, recorte y descarte de caras.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FastSetup {
+    /// Proyección · modelview, por columnas.
+    pub mvp: [f32; 16],
+    /// Modelview (afín), por columnas.
+    pub modelview: [f32; 16],
+    /// Columnas de la matriz de normales (con el reescalado ya aplicado).
+    pub normal: [[f32; 3]; 3],
+    pub viewport: [i32; 4],
+    pub depth_range: [f32; 2],
+    pub lighting: bool,
+    /// Normalizar la normal tras transformarla.
+    pub normalize: bool,
+    pub lights: [FastLight; 8],
+    pub light_count: usize,
+    /// Color = `base + color del vértice · (scene + Σ luces)`.
+    pub base: [f32; 3],
+    pub scene: [f32; 3],
+    /// Niebla lineal: `(fin, 1 / (fin - inicio))`.
+    pub fog: Option<(f32, f32)>,
+    /// Descarte de caras: se dibuja si `área · cull > 0` (con el área
+    /// positiva para los triángulos antihorarios). 0 = no se descarta nada.
+    pub cull: f32,
+    /// Sombreado plano: manda el color del tercer vértice.
+    pub flat: bool,
+}
+
+/// Vértice de entrada del camino rápido: posición (x, y, z) y `s`; normal
+/// (x, y, z) y `t`; color (r, g, b, a).
+pub type FastVertex = [f32; 12];

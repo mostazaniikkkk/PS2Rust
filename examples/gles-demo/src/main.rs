@@ -3,8 +3,9 @@
 //! la niebla, con cristales translúcidos girando alrededor.
 //!
 //! Todo se dibuja con las funciones estándar de GLES 1.0 y EGL del crate
-//! `ps2-gles`; debajo, el Emotion Engine transforma e ilumina y el Graphics
-//! Synthesizer rasteriza.
+//! `ps2-gles`; debajo, la unidad vectorial VU1 transforma, ilumina y recorta
+//! los triángulos y el Graphics Synthesizer rasteriza. El cubo, que lleva
+//! brillo especular, es lo único que calcula el Emotion Engine.
 
 #![no_std]
 #![no_main]
@@ -231,6 +232,7 @@ fn main() {
         for frame in 0..FRAMES + 240 {
             if frame == FRAMES {
                 let elapsed = (ps2::time::micros() - start) / 1000;
+                println!("gles-demo: {} triangulos por la VU1", fast_triangles());
                 println!("gles-demo: {} frames en {} ms, glGetError() = {:#x}", FRAMES, elapsed, glGetError());
             }
             let time = frame as f32 / 60.0;

@@ -334,6 +334,24 @@ fn store_only(words: &[u32], base: u32, from: usize, reg: u32, tramp: &Tramp) ->
 
 /// Busca la pareja de la carga en `k`: devuelve el índice de la otra mitad.
 /// Lo que hay en medio no puede tocar `rt`.
+/// Como `find_partner`, pero sigue leyendo en línea recta más allá de los
+/// saltos. Sólo sirve para reconocer parejas que no hay que tocar.
+fn find_partner_across_branches(words: &[u32], k: usize) -> Option<usize> {
+    let w = words[k];
+    let rt = rt_of(w);
+    for j in k + 1..words.len().min(k + 24) {
+        let x = words[j];
+        if partners(w, x) {
+            return Some(j);
+        }
+        let r = decode(x);
+        if r.write == Some(rt) || r.reads & (1 << rt) != 0 {
+            return None;
+        }
+    }
+    None
+}
+
 fn find_partner(words: &[u32], k: usize, tramp: &Tramp) -> Option<usize> {
     let w = words[k];
     let rt = rt_of(w);
@@ -434,6 +452,17 @@ pub fn fix(code: &mut [(u32, Vec<u32>)], data: &[u32], tramp_in: Option<&mut (u3
                 continue;
             }
             let Some(p) = find_partner(words, k, &tramp) else {
+                // La pareja puede estar al otro lado de un salto (LLVM a veces
+                // deja la segunda mitad en el destino). Si el valor sólo se
+                // copia a memoria no hay nada que corregir: basta reconocerla.
+                if let Some(p) = find_partner_across_branches(words, k) {
+                    if store_only(words, *base, p, rt_of(w), &tramp) {
+                        done.insert(p);
+                        out.store_only += 1;
+                        k += 1;
+                        continue;
+                    }
+                }
                 out.errors.push((addr, "carga no alineada (lwl/lwr) sin su pareja".into()));
                 k += 1;
                 continue;
@@ -608,6 +637,20 @@ mod tests {
         let r = fix(&mut code, &[], None, false);
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         assert_eq!(r.store_only, 2);
+    }
+
+    #[test]
+    fn copy_split_by_a_branch_is_recognised() {
+        // lwl $v1; bne (salta a la segunda mitad); nop; addiu $s5; lwr $v1; sw $v1.
+        let bne = 0x1420_0002u32; // bne $at, $zero, +2
+        let mut code = vec![(0x0010_0000, vec![lwl(3, 2, 7), bne, 0, addiu(21, 0, 0), lwr(3, 2, 4), sw(3, 5, 4), addiu(3, 0, 1)])];
+        let before = code[0].1.clone();
+        let r = fix(&mut code, &[], None, false);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!((r.store_only, &code[0].1), (1, &before));
+        // Si el valor se usa en un cálculo, sigue siendo un error.
+        let mut code = vec![(0x0010_0000, vec![lwl(3, 2, 7), bne, 0, addiu(21, 0, 0), lwr(3, 2, 4), xor(2, 3, 5), 0])];
+        assert!(!fix(&mut code, &[], None, false).errors.is_empty());
     }
 
     #[test]

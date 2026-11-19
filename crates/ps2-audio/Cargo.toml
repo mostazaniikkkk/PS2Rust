@@ -1,0 +1,12 @@
+[package]
+name = "ps2-audio"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+repository = "https://github.com/mostazaniikkkk/PS2Rust"
+description = "Sonido para PlayStation 2: flujo PCM y muestras ADPCM por el SPU2"
+
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ps2"))'] }

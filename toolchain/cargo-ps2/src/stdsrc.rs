@@ -28,6 +28,8 @@ const FILES: &[(&str, &str)] = &[
     ("sys/args/ps2.rs", include_str!("../../std-ps2/args.rs")),
     ("sys/env/ps2.rs", include_str!("../../std-ps2/env.rs")),
     ("sys/fs/ps2.rs", include_str!("../../std-ps2/fs.rs")),
+    ("sys/net/connection/ps2/mod.rs", include_str!("../../std-ps2/net/mod.rs")),
+    ("sys/net/connection/ps2/stack.rs", include_str!("../../std-ps2/net/stack.rs")),
     ("sys/io/error/ps2.rs", include_str!("../../std-ps2/io_error.rs")),
     ("sys/paths/ps2.rs", include_str!("../../std-ps2/paths.rs")),
     ("sys/random/ps2.rs", include_str!("../../std-ps2/random.rs")),
@@ -83,6 +85,11 @@ const PATCHES: &[Patch] = &[
         SELECT,
         "    target_os = \"ps2\" => {\n        mod ps2;\n        use ps2 as imp;\n        pub use ps2::ps2_resolve;\n    }\n",
     ),
+    after("src/sys/net/connection/mod.rs", SELECT, "    target_os = \"ps2\" => {
+        mod ps2;
+        pub use ps2::*;
+    }
+"),
     after("src/sys/random/mod.rs", SELECT, "    target_os = \"ps2\" => {\n        mod ps2;\n        pub use ps2::fill_bytes;\n    }\n"),
     after("src/sys/io/error/mod.rs", SELECT, "    target_os = \"ps2\" => {\n        mod ps2;\n        pub use ps2::*;\n    }\n"),
     before("src/sys/args/mod.rs", SELECT, "#[cfg(target_os = \"ps2\")]\nmod common;\n\n"),
@@ -92,7 +99,7 @@ const PATCHES: &[Patch] = &[
     after(
         "src/sys/paths/mod.rs",
         SELECT,
-        "    target_os = \"ps2\" => {\n        mod ps2;\n        #[allow(dead_code)]\n        mod unsupported;\n        mod imp {\n            pub use super::ps2::{getcwd, chdir, current_exe, temp_dir, home_dir};\n            pub use super::unsupported::{SplitPaths, split_paths, JoinPathsError, join_paths};\n        }\n    }\n",
+        "    target_os = \"ps2\" => {\n        mod ps2;\n        pub use ps2::exe_dir;\n        #[allow(dead_code)]\n        mod unsupported;\n        mod imp {\n            pub use super::ps2::{getcwd, chdir, current_exe, temp_dir, home_dir};\n            pub use super::unsupported::{SplitPaths, split_paths, JoinPathsError, join_paths};\n        }\n    }\n",
     ),
     after(
         "src/sys/exit.rs",

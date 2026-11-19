@@ -399,7 +399,7 @@ pub unsafe fn glDrawArrays(mode: GLenum, first: GLint, count: GLsizei) {
     if count < 0 || first < 0 {
         fail!(c, GL_INVALID_VALUE);
     }
-    c.draw(mode, count as usize, &|i| first as usize + i);
+    c.draw(mode, count as usize, Some(first as usize), &|i| first as usize + i);
 }
 
 pub unsafe fn glDrawElements(mode: GLenum, count: GLsizei, kind: GLenum, indices: *const GLvoid) {
@@ -412,10 +412,10 @@ pub unsafe fn glDrawElements(mode: GLenum, count: GLsizei, kind: GLenum, indices
     }
     if kind == GL_UNSIGNED_BYTE {
         let p = indices as *const u8;
-        c.draw(mode, count as usize, &|i| p.add(i).read() as usize);
+        c.draw(mode, count as usize, None, &|i| p.add(i).read() as usize);
     } else {
         let p = indices as *const u16;
-        c.draw(mode, count as usize, &|i| p.add(i).read_unaligned() as usize);
+        c.draw(mode, count as usize, None, &|i| p.add(i).read_unaligned() as usize);
     }
 }
 

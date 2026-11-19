@@ -3,6 +3,23 @@
 version = 4
 
 [[package]]
+name = "av-demo"
+version = "0.1.0"
+dependencies = [
+ "ps2",
+ "ps2-audio",
+ "ps2-pad",
+]
+
+[[package]]
+name = "av-selftest"
+version = "0.1.0"
+dependencies = [
+ "ps2-audio",
+ "ps2-pad",
+]
+
+[[package]]
 name = "cube"
 version = "0.1.0"
 dependencies = [
@@ -51,6 +68,21 @@ name = "iop-selftest-runner"
 version = "0.1.0"
 
 [[package]]
+name = "net-demo"
+version = "0.1.0"
+dependencies = [
+ "ps2",
+ "ps2-web",
+]
+
+[[package]]
+name = "net-selftest"
+version = "0.1.0"
+dependencies = [
+ "ps2-web",
+]
+
+[[package]]
 name = "panic-demo"
 version = "0.1.0"
 dependencies = [
@@ -59,6 +91,10 @@ dependencies = [
 
 [[package]]
 name = "ps2"
+version = "0.1.0"
+
+[[package]]
+name = "ps2-audio"
 version = "0.1.0"
 
 [[package]]
@@ -71,6 +107,28 @@ dependencies = [
 [[package]]
 name = "ps2-iop"
 version = "0.1.0"
+
+[[package]]
+name = "ps2-pad"
+version = "0.1.0"
+
+[[package]]
+name = "ps2-web"
+version = "0.1.0"
+
+[[package]]
+name = "ps2net"
+version = "0.1.0"
+dependencies = [
+ "ps2-iop",
+]
+
+[[package]]
+name = "ps2snd"
+version = "0.1.0"
+dependencies = [
+ "ps2-iop",
+]
 
 [[package]]
 name = "rustiop"

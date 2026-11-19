@@ -1,0 +1,10 @@
+[package]
+name = "av-selftest"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+repository = "https://github.com/mostazaniikkkk/PS2Rust"
+
+[dependencies]
+ps2-audio = { path = "../../crates/ps2-audio" }
+ps2-pad = { path = "../../crates/ps2-pad" }

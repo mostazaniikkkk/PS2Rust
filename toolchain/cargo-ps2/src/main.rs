@@ -9,6 +9,8 @@
 mod elf;
 mod emu;
 mod irx;
+#[cfg(test)]
+mod net_tests;
 mod mips1;
 mod r5900;
 mod stdsrc;
@@ -56,11 +58,16 @@ OPCIONES DE run:
         --screenshot <png>   Captura la ventana del emulador antes de cerrar
         --log <archivo>      Guarda la salida de la consola del EE
         --keep-open          No cierra el emulador al terminar el programa
+        --keys               Pruebas del mando: cuando el programa imprime
+                             `[tecla] pulsa X` o `[tecla] suelta X`, envía esa tecla
+                             a la ventana del emulador (sólo Windows)
 
 `check` verifica que un ELF sólo use instrucciones del R5900, o que un IRX
 sólo use las del R3000A. El resultado queda en target/ps2/<nombre>.elf (EE) o
 target/ps2/<nombre>.irx (IOP). Un IRX no se ejecuta solo: lo carga un programa
-del EE (ver examples/iop-demo).
+del EE (ver examples/iop-demo). Junto a los ELF se dejan ps2net.irx (red, lo
+carga std::net) y ps2snd.irx (sonido, lo carga ps2-audio): los programas los
+buscan en la carpeta del ejecutable.
 ";
 
 struct Opts {
@@ -75,6 +82,7 @@ struct Opts {
     screenshot: Option<String>,
     log: Option<String>,
     keep_open: bool,
+    keys: bool,
     iop: bool,
     verify_relocs: bool,
     extra: Vec<String>,
@@ -170,6 +178,7 @@ fn parse_opts(args: &[String]) -> Opts {
         screenshot: None,
         log: None,
         keep_open: false,
+        keys: false,
         iop: false,
         verify_relocs: false,
         extra: Vec::new(),
@@ -192,6 +201,7 @@ fn parse_opts(args: &[String]) -> Opts {
             "--screenshot" => o.screenshot = Some(val(a)),
             "--log" => o.log = Some(val(a)),
             "--keep-open" => o.keep_open = true,
+            "--keys" => o.keys = true,
             "--iop" => o.iop = true,
             "--verify-relocs" => o.verify_relocs = true,
             "--" => {
@@ -311,6 +321,9 @@ fn build_at(o: &Opts, iop_base: Option<u32>) -> Vec<PathBuf> {
     );
 
     let library = stdsrc::prepare(&support).unwrap_or_else(|e| die(e));
+    if !o.iop {
+        provide_iop_modules(o, &support, &out_dir);
+    }
 
     let mut c = Command::new(cargo());
     c.arg("build");
@@ -425,6 +438,105 @@ fn check_irx(name: &str, bytes: &[u8]) -> Option<usize> {
 
 fn fnv1a(data: &[u8]) -> u64 {
     data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+/// Módulos del IOP que acompañan a los programas: `ps2net.irx` (el adaptador
+/// de red, para `std::net`) y `ps2snd.irx` (el sonido, para `ps2-audio`).
+const IOP_MODULES: [&str; 2] = ["ps2net", "ps2snd"];
+
+/// Sus fuentes y las del runtime `ps2-iop`, como un workspace aparte.
+const IOP_MODULE_FILES: &[(&str, &str)] = &[
+    ("ps2net/src/main.rs", include_str!("../../../crates/ps2net/src/main.rs")),
+    ("ps2net/Cargo.toml", "[package]
+name = \"ps2net\"
+version = \"0.1.0\"
+edition = \"2021\"
+
+[dependencies]
+ps2-iop = { path = \"../ps2-iop\" }
+"),
+    ("ps2snd/src/main.rs", include_str!("../../../crates/ps2snd/src/main.rs")),
+    ("ps2snd/Cargo.toml", "[package]
+name = \"ps2snd\"
+version = \"0.1.0\"
+edition = \"2021\"
+
+[dependencies]
+ps2-iop = { path = \"../ps2-iop\" }
+"),
+    ("ps2-iop/Cargo.toml", "[package]
+name = \"ps2-iop\"
+version = \"0.1.0\"
+edition = \"2021\"
+"),
+    ("ps2-iop/src/console.rs", include_str!("../../../crates/ps2-iop/src/console.rs")),
+    ("ps2-iop/src/heap.rs", include_str!("../../../crates/ps2-iop/src/heap.rs")),
+    ("ps2-iop/src/kernel.rs", include_str!("../../../crates/ps2-iop/src/kernel.rs")),
+    ("ps2-iop/src/lib.rs", include_str!("../../../crates/ps2-iop/src/lib.rs")),
+    ("ps2-iop/src/math.rs", include_str!("../../../crates/ps2-iop/src/math.rs")),
+    ("ps2-iop/src/rpc.rs", include_str!("../../../crates/ps2-iop/src/rpc.rs")),
+    ("ps2-iop/src/sync.rs", include_str!("../../../crates/ps2-iop/src/sync.rs")),
+    ("ps2-iop/src/thread.rs", include_str!("../../../crates/ps2-iop/src/thread.rs")),
+    ("ps2-iop/src/time.rs", include_str!("../../../crates/ps2-iop/src/time.rs")),
+    (
+        "Cargo.toml",
+        "[workspace]
+resolver = \"2\"
+members = [\"ps2-iop\", \"ps2net\", \"ps2snd\"]
+
+         [profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = \"abort\"
+",
+    ),
+];
+
+/// Deja los módulos del IOP junto a los ELF, que es de donde los cargan los
+/// programas. Se compilan una vez (y cuando cambian sus fuentes) en la
+/// carpeta de apoyo.
+fn provide_iop_modules(o: &Opts, support: &Path, out_dir: &Path) {
+    let dir = support.join("iop-modules");
+    let stamp = dir.join("fuentes.hash");
+    let hash = format!("{:016x}", IOP_MODULE_FILES.iter().fold(0u64, |h, (name, text)| h.rotate_left(7) ^ fnv1a(name.as_bytes()) ^ fnv1a(text.as_bytes())));
+    let built = |name: &str| dir.join(format!("{name}.irx"));
+    if IOP_MODULES.iter().any(|m| !built(m).is_file()) || fs::read_to_string(&stamp).map(|s| s != hash).unwrap_or(true) {
+        for (name, text) in IOP_MODULE_FILES {
+            let path = dir.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap_or_else(|e| die(format!("no pude crear {}: {e}", dir.display())));
+            write_if_changed(&path, text);
+        }
+        for name in IOP_MODULES {
+            eprintln!("      IOP: compilando {name}.irx, que acompaña a los programas");
+            let module = Opts {
+                package: Some(name.to_string()),
+                bin: None,
+                debug: false,
+                manifest: Some(dir.join("Cargo.toml").to_string_lossy().into_owned()),
+                verbose: o.verbose,
+                emulator: None,
+                timeout: 60,
+                until: None,
+                screenshot: None,
+                log: None,
+                keep_open: false,
+                keys: false,
+                iop: true,
+                verify_relocs: false,
+                extra: Vec::new(),
+            };
+            let outputs = build_at(&module, None);
+            fs::copy(&outputs[0], built(name)).unwrap_or_else(|e| die(format!("no pude copiar {}: {e}", outputs[0].display())));
+        }
+        let _ = fs::write(&stamp, &hash);
+    }
+    for name in IOP_MODULES {
+        let target = out_dir.join(format!("{name}.irx"));
+        if fs::read(&target).ok() != fs::read(built(name)).ok() {
+            fs::copy(built(name), &target).unwrap_or_else(|e| die(format!("no pude copiar {name}.irx a {}: {e}", target.display())));
+        }
+    }
 }
 
 fn write_if_changed(path: &Path, content: &str) {

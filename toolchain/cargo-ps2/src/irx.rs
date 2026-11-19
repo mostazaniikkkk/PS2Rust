@@ -74,6 +74,7 @@ struct Section {
     size: usize,
     link: u32,
     info: u32,
+    align: u32,
 }
 
 fn u16le(b: &[u8], o: usize) -> u16 {
@@ -121,6 +122,7 @@ fn sections(b: &[u8]) -> Result<Vec<Section>, String> {
                 size: u32le(b, s + 20) as usize,
                 link: u32le(b, s + 24),
                 info: u32le(b, s + 28),
+                align: u32le(b, s + 32),
             }
         })
         .collect())
@@ -160,6 +162,14 @@ pub fn convert(elf: &[u8]) -> Result<Irx, String> {
     let text = alloc.iter().find(|s| s.name == ".text").ok_or("el módulo no tiene sección .text")?;
     if text.addr != 0 {
         return Err("el módulo debe enlazarse en la dirección 0 (linker script del IOP)".into());
+    }
+    // El cargador coloca el módulo en una dirección múltiplo de 16 y no más:
+    // una alineación mayor pedida al enlazador no se cumpliría al cargar.
+    if let Some(s) = alloc.iter().find(|s| s.align > 16) {
+        return Err(format!(
+            "la sección {} pide alineación de {} bytes y el cargador del IOP sólo garantiza 16: \n             quita el `align` de ese dato o resérvalo en el heap",
+            s.name, s.align
+        ));
     }
     let text_size = (text.size as u32 + 15) & !15;
     let file_end = alloc
@@ -701,6 +711,17 @@ mod tests {
         let same = load_at(&irx.bytes, 0);
         let (text, _) = text_range(&irx.bytes).unwrap();
         assert_eq!(&same[..0x80], &irx.bytes[text..text + 0x80]);
+    }
+
+    #[test]
+    fn rejects_alignment_the_loader_cannot_honour() {
+        let mut elf = sample_elf();
+        // Alineación de .data (sección 2): 64 bytes.
+        let shoff = u32le(&elf, 32) as usize;
+        put32(&mut elf, shoff + 2 * 40 + 32, 64);
+        assert!(convert(&elf).err().unwrap().contains("alineación de 64"));
+        put32(&mut elf, shoff + 2 * 40 + 32, 16);
+        assert!(convert(&elf).is_ok());
     }
 
     #[test]

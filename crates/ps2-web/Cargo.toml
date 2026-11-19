@@ -1,0 +1,9 @@
+[package]
+name = "ps2-web"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+repository = "https://github.com/mostazaniikkkk/PS2Rust"
+description = "Cliente HTTP/1.1 y WebSocket sobre std::net, sin dependencias y sin TLS; pensado para la PlayStation 2"
+
+[dependencies]

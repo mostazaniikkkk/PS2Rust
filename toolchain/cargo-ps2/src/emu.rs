@@ -24,6 +24,7 @@ public class Ps2Win {
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
 }
 "@
 [void][Ps2Win]::SetProcessDPIAware()
@@ -39,7 +40,13 @@ $w = $r.R - $r.L; $ht = $r.B - $r.T
 if ($w -le 0 -or $ht -le 0) { Write-Error "ventana sin tamaño"; exit 3 }
 $bmp = New-Object System.Drawing.Bitmap $w, $ht
 $g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size)
+# Se pide a la ventana que se pinte a sí misma (con su contenido de vídeo):
+# así no salen otras ventanas ni avisos que tenga encima. Si no puede, se
+# copia esa zona de la pantalla.
+$hdc = $g.GetHdc()
+$ok = [Ps2Win]::PrintWindow($h, $hdc, 2)
+$g.ReleaseHdc($hdc)
+if (-not $ok) { $g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size) }
 $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
 "#;
 
@@ -63,7 +70,7 @@ fn strip_timestamp(line: &str) -> &str {
 /// Mensajes del propio PCSX2 y de los módulos de la BIOS en el IOP (FILEIO,
 /// LOADFILE) que se intercalan con la consola del EE. Con `-v` se muestran.
 fn is_emulator_noise(line: &str) -> bool {
-    const PREFIXES: [&str; 31] = [
+    const PREFIXES: [&str; 33] = [
         "Frame rate:",
         "Setting vsync mode:",
         "ELF changed, active CRC",
@@ -95,6 +102,8 @@ fn is_emulator_noise(line: &str) -> bool {
         "RegisterLibraryEntries:",
         "getstat name ",
         "cdvdLoadElf()",
+        "DEV9: ",
+        "microVU",
     ];
     PREFIXES.iter().any(|p| line.starts_with(p))
 }
@@ -161,6 +170,12 @@ pub fn run(elf: &Path, o: &Opts) -> Result<i32, String> {
                     eprintln!("[pcsx2] {line}");
                 }
                 continue;
+            }
+            if o.keys {
+                if let Some(order) = line.strip_prefix("[tecla] ") {
+                    keys::order(child.id(), order);
+                    continue;
+                }
             }
             println!("{line}");
             captured.push_str(line);
@@ -242,4 +257,94 @@ fn screenshot(pid: u32, png: &str, elf: &Path) -> Result<(), String> {
     }
     eprintln!("  Captura: {}", out.display());
     Ok(())
+}
+
+/// Teclas simuladas para las pruebas del mando (`--keys`). Se envían como
+/// mensajes a las ventanas del emulador, sin tocar el foco ni el teclado
+/// real: lo que el usuario esté escribiendo en otra ventana no se ve afectado.
+#[cfg(windows)]
+mod keys {
+    use std::ffi::c_void;
+
+    type Hwnd = *mut c_void;
+    type EnumProc = unsafe extern "system" fn(Hwnd, isize) -> i32;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(callback: EnumProc, param: isize) -> i32;
+        fn EnumChildWindows(parent: Hwnd, callback: EnumProc, param: isize) -> i32;
+        fn GetWindowThreadProcessId(window: Hwnd, process: *mut u32) -> u32;
+        fn IsWindowVisible(window: Hwnd) -> i32;
+        fn PostMessageW(window: Hwnd, message: u32, wparam: usize, lparam: isize) -> i32;
+        fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
+    }
+
+    struct Search {
+        pid: u32,
+        windows: Vec<Hwnd>,
+    }
+
+    unsafe extern "system" fn collect_top(window: Hwnd, param: isize) -> i32 {
+        let search = &mut *(param as *mut Search);
+        let mut pid = 0;
+        GetWindowThreadProcessId(window, &mut pid);
+        if pid == search.pid && IsWindowVisible(window) != 0 {
+            search.windows.push(window);
+            EnumChildWindows(window, collect_child, param);
+        }
+        1
+    }
+
+    unsafe extern "system" fn collect_child(window: Hwnd, param: isize) -> i32 {
+        (*(param as *mut Search)).windows.push(window);
+        1
+    }
+
+    /// Código de tecla virtual y si es una tecla "extendida".
+    fn virtual_key(name: &str) -> Option<(u32, bool)> {
+        Some(match name {
+            "Up" => (0x26, true),
+            "Down" => (0x28, true),
+            "Left" => (0x25, true),
+            "Right" => (0x27, true),
+            "Return" => (0x0D, false),
+            "Backspace" => (0x08, false),
+            "Space" => (0x20, false),
+            _ if name.len() == 1 && name.as_bytes()[0].is_ascii_alphanumeric() => (name.as_bytes()[0].to_ascii_uppercase() as u32, false),
+            _ => return None,
+        })
+    }
+
+    /// Ejecuta una orden `pulsa X` o `suelta X` sobre el emulador `pid`.
+    pub fn order(pid: u32, order: &str) {
+        let mut words = order.split_whitespace();
+        let (action, name) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+        let Some((key, extended)) = virtual_key(name) else {
+            eprintln!("  --keys: tecla desconocida en `{order}`");
+            return;
+        };
+        let down = match action {
+            "pulsa" => true,
+            "suelta" => false,
+            _ => return,
+        };
+        unsafe {
+            let mut search = Search { pid, windows: Vec::new() };
+            EnumWindows(collect_top, &mut search as *mut Search as isize);
+            let scan = MapVirtualKeyW(key, 0) as isize;
+            let lparam = 1 | scan << 16 | (extended as isize) << 24 | if down { 0 } else { 0xC000_0000 };
+            // WM_KEYDOWN / WM_KEYUP a la ventana y a sus hijas (la superficie
+            // de vídeo es una de ellas).
+            for window in search.windows {
+                PostMessageW(window, if down { 0x0100 } else { 0x0101 }, key as usize, lparam);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod keys {
+    pub fn order(_pid: u32, _order: &str) {
+        eprintln!("  --keys sólo está implementado en Windows");
+    }
 }

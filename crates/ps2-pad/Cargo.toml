@@ -1,0 +1,12 @@
+[package]
+name = "ps2-pad"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+repository = "https://github.com/mostazaniikkkk/PS2Rust"
+description = "Mandos de PlayStation 2 (DualShock 2): botones, sticks, presión y vibración"
+
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ps2"))'] }

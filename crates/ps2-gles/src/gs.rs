@@ -22,11 +22,17 @@
 //! * **Mipmaps.** Hasta 7 niveles, con el nivel de detalle calculado una vez
 //!   por triángulo.
 //!
+//! La geometría de los triángulos (transformación, iluminación, niebla,
+//! recorte y descarte de caras) la hace la unidad vectorial VU1 siempre que
+//! puede: ver `vu1prog.rs`. Lo que la VU1 no cubre llega aquí ya transformado
+//! por el Emotion Engine, vértice a vértice.
+//!
 //! Escalas del GS: en el alfa, 0x80 es 1,0; al modular con una textura, el
 //! color del vértice 0x80 es 1,0.
 
 use crate::blend::solve_blend;
 use crate::raster::*;
+use crate::vu1prog::{self, Key, Target};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use ps2::gs::{Gs, VideoMode};
@@ -67,6 +73,10 @@ struct Allocation {
 
 pub struct GsRasterizer {
     gs: Gs,
+    /// La unidad vectorial que hace la geometría de los triángulos.
+    vu1: crate::vu1::Vu1,
+    /// Triángulos enviados a la VU1 desde el arranque.
+    fast_triangles: u64,
     width: u32,
     height: u32,
     depth_bits: u32,
@@ -106,6 +116,8 @@ impl GsRasterizer {
         let first = depth_page + depth_pages;
         GsRasterizer {
             gs,
+            vu1: crate::vu1::Vu1::new(),
+            fast_triangles: 0,
             width,
             height,
             depth_bits,
@@ -478,6 +490,50 @@ impl Rasterizer for GsRasterizer {
 
     fn finish(&mut self) {
         self.gs.flush();
+    }
+
+    fn fast_triangles(&mut self, setup: &FastSetup, count: usize, fill: &mut dyn FnMut(&mut [FastVertex])) -> bool {
+        if !self.applied {
+            self.apply();
+        }
+        // El único caso que la VU1 no cubre: textura sólo de alfa con GL_REPLACE.
+        if self.opaque_vertex_alpha {
+            return false;
+        }
+        if self.nothing_visible || count < 3 {
+            // Nada que dibujar, pero los vértices hay que consumirlos igual.
+            return count < 3 || {
+                let mut skipped = [[0.0f32; 12]; 3];
+                (0..count / 3).for_each(|_| fill(&mut skipped));
+                true
+            };
+        }
+        // El estado va al GS por el GIF antes que los vértices de la VU1.
+        self.gs.flush();
+        let lod = match (self.needs_lod, self.state.texture) {
+            (true, Some(t)) => Some((self.tex1 as u32, (t.width * t.height) as f32)),
+            _ => None,
+        };
+        let target = Target {
+            height: self.height as f32,
+            origin: ORIGIN,
+            depth_max: ((1u32 << self.depth_bits) - 1) as f32,
+            inverted: self.inverted,
+            color_scale: if self.textured { 128.0 } else { 255.0 },
+            prim: (PRIM_TRIANGLE | self.prim_flags) as u32,
+            lod,
+        };
+        let key = Key::of(setup, &target);
+        self.vu1.draw(&key, &vu1prog::constants(setup, &target), count, fill);
+        self.fast_triangles += (count / 3) as u64;
+        // La VU1 ha dejado en el GS su PRIM y, con mipmaps, su TEX1.
+        self.prim = None;
+        self.lod_k = i32::MIN;
+        true
+    }
+
+    fn fast_triangle_count(&self) -> u64 {
+        self.fast_triangles
     }
 
     fn swap(&mut self) {

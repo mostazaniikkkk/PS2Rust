@@ -23,8 +23,11 @@
 //! }
 //! ```
 //!
-//! El núcleo (estado, matrices, iluminación, niebla, recorte) corre en el
-//! Emotion Engine y el Graphics Synthesizer rasteriza. Lo que el GS no puede
+//! El estado y las matrices los lleva el Emotion Engine; la geometría de los
+//! triángulos (transformación, iluminación, niebla, recorte) la hace la
+//! unidad vectorial VU1 con un microprograma propio ([`vu1prog`]), y el
+//! Graphics Synthesizer rasteriza. Lo que la VU1 no cubre (brillo especular,
+//! focos, niebla exponencial, puntos y líneas) lo calcula el Emotion Engine. Lo que el GS no puede
 //! hacer está documentado en [`gs`](crate::gs) y en el README.
 //!
 //! El crate también compila en el PC, con un rasterizador por software que
@@ -50,8 +53,19 @@ pub mod raster;
 #[cfg(not(target_arch = "mips"))]
 pub mod soft;
 pub mod texture;
+pub mod vu;
+#[cfg(target_arch = "mips")]
+mod vu1;
+pub mod vu1prog;
+#[cfg(not(target_arch = "mips"))]
+pub mod vuinterp;
+#[cfg(not(target_arch = "mips"))]
+pub mod vusoft;
+#[cfg(all(test, not(target_arch = "mips")))]
+mod vutests;
 
 pub use api::*;
 pub use consts::*;
+pub use context::fast_triangles;
 pub use egl::*;
 pub use fixed::*;

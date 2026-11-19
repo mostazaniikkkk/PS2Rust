@@ -362,3 +362,11 @@ pub fn current() -> Option<&'static mut Context> {
 pub(crate) fn set_current(context: *mut Context) {
     unsafe { CURRENT = context };
 }
+
+/// Triángulos que el rasterizador ha resuelto por su camino rápido (en la
+/// PS2, la unidad vectorial VU1) desde que se creó el contexto actual. No es
+/// parte de OpenGL ES: sirve para saber si una escena va por ahí o por el
+/// camino normal.
+pub fn fast_triangles() -> u64 {
+    current().map_or(0, |c| c.raster.fast_triangle_count())
+}

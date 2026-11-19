@@ -7,8 +7,11 @@ los archivos y los gráficos están escritos en Rust.
 
 También compila **módulos IRX para el IOP** (el procesador de E/S, un MIPS
 R3000A con 2 MiB de RAM), sin std: ver [Rust en el IOP](#rust-en-el-iop). Y
-trae **OpenGL ES 1.0** sobre el Graphics Synthesizer: ver
-[OpenGL ES 1.0](#opengl-es-10).
+trae **OpenGL ES 1.0** sobre el Graphics Synthesizer, con la geometría en la
+unidad vectorial VU1 ([OpenGL ES 1.0](#opengl-es-10))
+**red** (`std::net` con una pila TCP/IP propia, más HTTP y WebSocket: [Red](#red))
+y **mando y sonido** (DualShock 2 con presión y vibración, flujo PCM y voces
+ADPCM: [Mando y sonido](#mando-y-sonido)).
 
 | [`std-hello`](examples/std-hello/src/main.rs) | [`cube`](examples/cube/src/main.rs) | [`hello`](examples/hello/src/main.rs) |
 |---|---|---|
@@ -43,8 +46,8 @@ cargo ps2 run -p std-hello
 | `std::env` | `args` (el kernel los pasa), variables en memoria, `current_dir`/`set_current_dir` (al empezar, el directorio del ELF) |
 | `std::collections` | Todo, incluidos `HashMap`/`HashSet` con semillas aleatorias |
 | `std::process` | `exit` y `abort`; no hay `Command` |
-| `std::net` | No disponible (no hay pila de red) |
-| `std::os::ps2` | `load_iop_module`, `SifRpcClient` (llamadas RPC a módulos del IOP: mandos, sonido…), `reset_iop` (reinicia el IOP con los módulos de la BIOS), `cpu_cycles`, `heap_free_bytes` |
+| `std::net` | `TcpStream`, `TcpListener`, `UdpSocket` y resolución de nombres, con plazos y modo sin bloqueo; DHCP y DNS automáticos. IPv4. Ver [Red](#red) |
+| `std::os::ps2` | `load_iop_module`, `SifRpcClient` (llamadas RPC a módulos del IOP: mandos, sonido…), `reset_iop` (reinicia el IOP con los módulos de la BIOS), `network_info` y `set_network_config` (dirección de red), `exe_dir`, `flush_data_cache`, `cpu_cycles`, `heap_free_bytes` |
 
 Un pánico (en cualquier hilo) imprime el mensaje y termina con código 101: se
 compila con `panic = "abort"`, no hay desenrollado.
@@ -149,15 +152,50 @@ La captura es [`gles-demo`](examples/gles-demo/src/main.rs): texturas con
 mipmaps, iluminación con brillo especular, niebla, mezcla alfa y búfer de
 profundidad, todo con llamadas estándar.
 
-El Emotion Engine hace lo que en GLES 1.0 es "geometría" (matrices,
-iluminación por vértice, niebla, recorte contra el volumen de visión, descarte
-de caras) y el Graphics Synthesizer rasteriza. Está todo lo de la
-especificación 1.0: los siete tipos de primitiva, arrays de vértices en todos
-sus formatos, las tres pilas de matrices, ocho luces (direccionales, puntuales
-y focos) con materiales, niebla lineal y exponencial, texturas en todos los
-formatos de 1.0 más las de paleta (`OES_compressed_paletted_texture`), filtros
-y mipmaps, pruebas de alfa, profundidad y recorte, mezcla, máscaras,
-`glReadPixels`, `glCopyTexImage2D` y los errores de GL.
+Está todo lo de la especificación 1.0: los siete tipos de primitiva, arrays de
+vértices en todos sus formatos, las tres pilas de matrices, ocho luces
+(direccionales, puntuales y focos) con materiales, niebla lineal y exponencial,
+texturas en todos los formatos de 1.0 más las de paleta
+(`OES_compressed_paletted_texture`), filtros y mipmaps, pruebas de alfa,
+profundidad y recorte, mezcla, máscaras, `glReadPixels`, `glCopyTexImage2D` y
+los errores de GL.
+
+### La geometría, en la VU1
+
+`glDrawArrays` y `glDrawElements` no transforman nada en la CPU: mandan los
+vértices tal cual a la **unidad vectorial VU1**, por VIF y DMA, y un
+microprograma hace ahí la transformación, la iluminación, la niebla, el
+descarte de caras y el recorte, y envía los triángulos al GS. El programa no
+cambia nada: son las mismas llamadas de GL, más rápidas.
+
+| | Triángulos iluminados por segundo (malla indexada de 2048, en PCSX2) |
+|---|---|
+| Todo en la FPU del Emotion Engine (antes) | unos 53 000 |
+| Geometría en la VU1 | unos 350 000 |
+
+- **El microprograma** ([vu1prog.rs](crates/ps2-gles/src/vu1prog.rs)) se
+  genera a medida del estado de GL: sin luces no lleva código de luces, cada
+  luz lleva el de su tipo, etc., así que dentro no hay comprobaciones de modo.
+  Cuesta entre 180 y 470 instrucciones por triángulo (de sin luces a ocho).
+- **Recorte de verdad**: un triángulo que cruza el plano cercano o el lejano,
+  o se sale de la banda de guarda del GS, se recorta en la VU1 contra los seis
+  planos (un suelo que pasa bajo la cámara no se pierde ni vuelve a la CPU).
+- **Nivel de detalle de las texturas** por triángulo, también en la VU1.
+- **LLVM no sabe generar código para las VU**, así que el microprograma está
+  escrito con un ensamblador mínimo hecho en Rust
+  ([vu.rs](crates/ps2-gles/src/vu.rs)), y hay un intérprete de la VU1 para el
+  PC ([vuinterp.rs](crates/ps2-gles/src/vuinterp.rs)) que lo ejecuta en las
+  pruebas y vigila las trampas del hardware (esperas de la división y del
+  registro de recorte, retraso de los saltos).
+
+Va por la VU1 todo triángulo (sueltos, tiras, abanicos, con o sin índices) con
+luces direccionales y puntuales (ambiente, difusa, emisión, atenuación, color
+como material), niebla lineal, texturas y sombreado suave o plano. **Vuelve a
+la CPU**, llamada a llamada y con el mismo resultado, lo que la VU1 no sabe
+calcular o no merece la pena: brillo especular, focos, niebla exponencial,
+iluminación a dos caras, `glPolygonOffset`, vértices con `w`, y los puntos y
+las líneas. `ps2_gles::fast_triangles()` dice cuántos triángulos han ido por
+la VU1.
 
 Lo que el GS no puede hacer, y cómo se comporta aquí:
 
@@ -174,7 +212,152 @@ El crate también compila en el PC, donde rasteriza una referencia por software
 que sigue la especificación al pie de la letra. La batería
 [`gles-selftest`](examples/gles-selftest/src/gl_suite.rs) dibuja, lee los
 píxeles con `glReadPixels` y los compara con lo que manda la especificación:
-253 comprobaciones que pasan igual en el PC y en la PS2.
+253 comprobaciones que pasan igual en el PC y en la PS2 (donde los triángulos
+van por la VU1), y también en el PC con el microprograma interpretado.
+
+## Red
+
+`std::net` funciona: la PS2 pide dirección por DHCP, resuelve nombres por DNS
+y abre conexiones TCP y UDP con el adaptador de red (en PCSX2, el Ethernet
+emulado).
+
+```rust
+use std::io::{Read, Write};
+use std::net::{TcpStream, UdpSocket};
+use std::time::Duration;
+
+let mut stream = TcpStream::connect("example.com:80")?;        // DHCP y DNS, solos
+stream.set_read_timeout(Some(Duration::from_secs(5)))?;         // o set_nonblocking(true)
+stream.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")?;
+let mut page = String::new();
+stream.read_to_string(&mut page)?;
+
+let socket = UdpSocket::bind("0.0.0.0:0")?;
+socket.send_to(b"hola", "192.168.1.20:9000")?;
+let (n, from) = socket.recv_from(&mut [0u8; 1500])?;
+```
+
+![DHCP, DNS y una página de Internet descargada por HTTP desde la PS2](docs/net-demo.png)
+
+Está hecho en dos mitades, las dos en Rust y sin código ajeno:
+
+- **`ps2net.irx`** ([crates/ps2net](crates/ps2net/src/main.rs)), un módulo del
+  IOP con el driver del adaptador: enciende la interfaz de expansión (DEV9),
+  lee la dirección MAC de la EEPROM, arranca el controlador Ethernet (SMAP) y
+  negocia el enlace. Sólo mueve tramas Ethernet. `cargo ps2` lo compila y lo
+  deja junto al ELF, y la std lo carga de la carpeta del ejecutable la primera
+  vez que se usa la red (en un disco o una tarjeta de memoria debe ir al lado
+  del programa).
+- **La pila TCP/IP** ([stack.rs](toolchain/std-ps2/net/stack.rs)) dentro de la
+  std, en el EE: ARP, IPv4, ICMP (responde a ping), UDP, TCP y los clientes de
+  DHCP y DNS. Encima va `std::net` completo para IPv4: `TcpStream` (con
+  `set_read_timeout`, `set_nonblocking`, `peek`, `shutdown`, `try_clone`…),
+  `TcpListener`, `UdpSocket` y `ToSocketAddrs` con nombres de host.
+
+`std::os::ps2::network_info()` devuelve la dirección obtenida y
+`set_network_config` la fija a mano si no hay DHCP. Sólo 127.0.0.1 es bucle
+local: el resto de 127.0.0.0/8 sale por el adaptador, lo que con PCSX2 permite
+hablar con servicios del propio PC (por ejemplo uno que escuche en 127.0.0.2).
+
+### HTTP y WebSocket
+
+El crate [`ps2-web`](crates/ps2-web/src/lib.rs) pone encima un cliente
+HTTP/1.1 y WebSocket, sólo con la biblioteca estándar (funciona igual en el
+PC):
+
+```rust
+use ps2_web::{http, ws::{Message, WebSocket}};
+
+let page = http::get("http://example.com/")?;                  // sigue redirecciones
+let reply = http::post("http://192.168.1.20:8080/api", "application/json", "{\"hola\":1}")?;
+
+let mut socket = WebSocket::connect("ws://192.168.1.20:9000/chat")?;
+socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+loop {
+    match socket.read() {
+        Ok(Message::Text(text)) => println!("{text}"),
+        Err(ps2_web::Error::Timeout) => socket.ping(b"latido")?,  // conexión larga con latidos
+        Ok(Message::Close(_)) | Err(_) => break,
+        Ok(_) => {}
+    }
+}
+```
+
+HTTP: `GET`/`POST` y cualquier otro método con `Request`, cabeceras, cuerpos
+con `Content-Length`, troceados o hasta el cierre, y redirecciones. WebSocket:
+texto, binario, ping/pong, mensajes fragmentados, cierre, y también el lado
+servidor (`WebSocket::accept`). **Sin TLS**: `https://` y `wss://` devuelven
+`Error::Tls`.
+
+## Mando y sonido
+
+Lo que le falta a un motor para ser un juego. Los dos viven en el IOP y los
+dos crates hablan con él por RPC desde un programa con std.
+
+![El mando en vivo y el estado del chip de sonido](docs/av-demo.png)
+
+### Mando: `ps2-pad`
+
+```rust
+use ps2_pad::{Button, Pads};
+
+let mut pads = Pads::init()?;
+let mut pad = pads.open(0)?;                 // puerto 1 de la consola
+loop {
+    if let Some(input) = pad.poll() {        // una vez por frame
+        if input.pressed(Button::Cross) { /* saltar */ }
+        let fuerza = input.pressure(Button::R2);       // 0..=255
+        let (x, y) = input.left_stick();               // -1.0..=1.0
+        pad.rumble(false, fuerza);                     // motor grande
+    }
+}
+```
+
+[`ps2-pad`](crates/ps2-pad/src/lib.rs) carga los módulos de mandos de la BIOS
+(`rom0:XSIO2MAN` y `rom0:XPADMAN`, o los `SIO2MAN`/`PADMAN` originales en las
+primeras consolas: los dos protocolos están implementados y probados) y lee el
+estado que el IOP deja una vez por frame en la memoria del EE. `poll` también
+configura el mando cuando se conecta, sin bloquear: modo analógico fijado,
+motores de vibración y botones sensibles a la presión. Da los 16 botones, los
+dos sticks, la presión de 12 botones y la vibración de los dos motores, en los
+dos puertos, y detecta cuándo se enchufa y se desenchufa.
+
+### Sonido: `ps2-audio`
+
+```rust
+use ps2_audio::{to_stream, Audio};
+
+let mut audio = Audio::init()?;
+
+// Flujo PCM: música, o la mezcla de tu motor. Estéreo, 16 bits, 48 kHz.
+audio.write_all(&to_stream(&pcm_44100_mono, 1, 44100));
+
+// Efectos: muestras en las 24 voces del chip, con volumen por canal y tono.
+let disparo = audio.load_sample(&pcm_mono, 22050, false)?;
+audio.play(0, &disparo, 1.0, 0.4);
+audio.play_at(1, &disparo, 0.5, 0.5, 1.5);   // más agudo
+```
+
+[`ps2-audio`](crates/ps2-audio/src/lib.rs) tiene dos mitades. En el IOP,
+[`ps2snd.irx`](crates/ps2snd/src/main.rs): un módulo en Rust que usa la
+biblioteca de sonido de la BIOS (`rom0:LIBSD`) para manejar el chip (SPU2);
+`cargo ps2` lo compila y lo deja junto al ELF, como el de red. En el EE, la
+API:
+
+- **Flujo PCM**: una cola de 16 384 muestras estéreo (unos 340 ms) que el
+  módulo va entregando al chip en bloques de 512, 93,75 veces por segundo.
+  `write` no bloquea y dice cuántas cupieron; `write_all` espera; `status`
+  dice cuánto queda en cola. `to_stream` convierte mono o estéreo de cualquier
+  frecuencia a 48 kHz.
+- **Voces**: `load_sample` codifica PCM al ADPCM del chip
+  ([adpcm.rs](crates/ps2-audio/src/adpcm.rs), también usable en el PC para
+  preparar los datos de antemano) y lo sube a la memoria de sonido; `play` lo
+  toca en una de las 24 voces, una vez o en bucle, con volumen por canal y
+  velocidad; `is_playing`, `free_voice`, `stop`.
+
+[`av-demo`](examples/av-demo/src/main.rs) junta las dos cosas: dibuja el mando
+en vivo y toca notas con los botones (más fuerte cuanto más se aprieta), una
+melodía por el flujo con Start y vibra con L2/R2.
 
 ## Rust en el IOP
 
@@ -272,6 +455,8 @@ cargo ps2 build --iop -p rustiop   # módulo del IOP -> target/ps2/rustiop.irx
 cargo ps2 run -p iop-demo          # el programa del EE que lo carga y lo llama
 cargo ps2 check modulo.irx         # ¿este IRX sólo usa instrucciones del R3000A?
 cargo ps2 run -p gles-demo         # OpenGL ES 1.0 sobre el Graphics Synthesizer
+cargo ps2 run -p net-demo          # DHCP, DNS y una página de Internet por HTTP
+cargo ps2 run -p av-demo --keep-open   # mando y sonido: pruébalo con tu mando
 cargo ps2 help
 ```
 
@@ -300,7 +485,9 @@ panic = "abort"
 Para un módulo del IOP, la dependencia es
 `ps2-iop = { git = "https://github.com/mostazaniikkkk/PS2Rust" }`; para OpenGL
 ES, `ps2-gles = { git = "https://github.com/mostazaniikkkk/PS2Rust" }`, con o
-sin std.
+sin std; para HTTP y WebSocket, `ps2-web` igual, y `ps2-pad` y `ps2-audio`
+para mando y sonido. `std::net` no necesita nada:
+viene con la std.
 
 El `.elf` resultante se puede cargar en PCSX2 (Sistema → Ejecutar ELF) o en una
 consola con un lanzador de homebrew.
@@ -326,6 +513,8 @@ defecto) añade el arranque, el asignador, el manejador de pánicos y
 - [std-selftest](examples/std-selftest/src/std_suite.rs): batería de la std (25 comprobaciones, más las 33 de `core`/`alloc`).
 - [std-panic](examples/std-panic/src/main.rs): pánico en un hilo con nombre.
 - [hello](examples/hello/src/main.rs), [cube](examples/cube/src/main.rs), [selftest](examples/selftest/src/suite.rs), [panic](examples/panic/src/main.rs): los mismos temas sin std (`#![no_std]`).
+- [av-demo](examples/av-demo/src/main.rs) y [av-selftest](examples/av-selftest/src/main.rs): mando y sonido, y su batería (con [pad-keys](examples/av-selftest/src/bin/pad-keys.rs) para probar cada botón con teclas simuladas).
+- [net-demo](examples/net-demo/src/main.rs) y [net-selftest](examples/net-selftest/src/net_suite.rs): la PS2 en Internet, y la batería de `std::net`, HTTP y WebSocket.
 - [gles-demo](examples/gles-demo/src/main.rs) y [gles-selftest](examples/gles-selftest/src/gl_suite.rs): una escena con OpenGL ES 1.0 y su batería de pruebas de píxeles.
 - [iop-module](examples/iop-module/src/main.rs) (`rustiop.irx`) e [iop-demo](examples/iop-demo/src/main.rs): un módulo del IOP con servidor RPC y dos hilos, y el programa del EE que lo usa.
 - [iop-selftest](examples/iop-selftest/src/main.rs) e [iop-selftest-runner](examples/iop-selftest-runner/src/main.rs): la batería de `core`/`alloc` corriendo en el IOP, lanzada desde el EE.
@@ -336,12 +525,19 @@ defecto) añade el arranque, el asignador, el manejador de pánicos y
 powershell -ExecutionPolicy Bypass -File verify.ps1 -Emulator C:\ruta\pcsx2-qt.exe
 ```
 
-El script compila los once programas del EE y los dos módulos del IOP, los
-ejecuta en PCSX2 y comprueba los resultados (16 pasos). Las pruebas principales
+El script compila los quince paquetes del EE y los cuatro módulos del IOP, los
+ejecuta en PCSX2 y comprueba los resultados (23 pasos; uno más con
+`-PadEmulator`, que prueba cada botón del mando enviando teclas simuladas a un
+PCSX2 que tenga el mando 1 en el teclado). La batería de mando y sonido hace
+sonar tonos cortos y bajos. Las pruebas principales
 son diferenciales: las baterías se compilan tal cual para el PC y para la PS2,
 y las dos salidas deben coincidir byte a byte (212 líneas con la std en el EE;
 131 en el IOP, donde la misma batería corre sin FPU ni atómicos; 275 la de
-OpenGL ES, que compara píxeles leídos del GS con la referencia). Cubren enteros de 32/64/128
+OpenGL ES, que compara píxeles leídos del GS con la referencia; 98 la de
+red, en la que la PS2 y el PC hablan con el mismo servidor de pruebas, que el
+script levanta en 127.0.0.2 y sólo es accesible desde el propio PC). La demo
+de red hace además una petición real a `example.com`, así que ese paso
+necesita Internet. Cubren enteros de 32/64/128
 bits, `f64` por software, `f32` en la FPU, formato, colecciones, `Rc`/`Arc`,
 atómicos, el heap, UTF-8, hilos, `Mutex`/`Condvar`/`RwLock`/`Barrier`,
 canales, `thread_local!`, `sleep`, `SystemTime`, archivos (incluidos nombres
@@ -366,15 +562,38 @@ de 1 a 16 caracteres) y el entorno.
   abierto no se puede borrar en `host:`. Las fechas de la PS2 están en hora de
   Japón; las de los archivos de `host:` con PCSX2 llegan en la hora local del
   PC, así que `modified()` puede desfasarse unas horas.
-- **Sin `std::net`, `std::process::Command` ni `stdin`.** El mando y el sonido
-  tampoco están: viven en el IOP y necesitan sus propios módulos.
+- **Sin `std::process::Command` ni `stdin`.**
+- **Mando y sonido** necesitan la std (hablan con el IOP por RPC). El mando
+  usa los módulos de la BIOS, sin multitap: un mando por puerto. El sonido es
+  estéreo a 48 kHz, sin reverberación ni salida digital multicanal; el
+  codificador ADPCM es sencillo (unos 25 dB o más de relación señal/ruido en
+  las pruebas). Las primeras consolas japonesas no traen `rom0:LIBSD` y ahí
+  `Audio::init` falla. En las pruebas se comprueba que las muestras llegan al
+  chip y lo que mezclan las voces leyendo su memoria, pero nadie ha escuchado
+  la salida desde las pruebas automáticas, y la vibración sólo se sabe que el
+  mando emulado la acepta. Probado en PCSX2, no en una consola.
+- **Red**: sólo IPv4, sin multidifusión ni fragmentación de IP. No hay TLS:
+  `ps2-web` habla `http://` y `ws://`, no `https://` ni `wss://` (la mayoría
+  de los servicios de Internet de hoy, Steam incluido, exigen TLS). El TCP es
+  sencillo: retransmite por temporizador, no reordena segmentos adelantados ni
+  tiene control de congestión, así que rinde bien en una red local y regular
+  en enlaces con muchas pérdidas. La pila avanza cuando el programa llama a la
+  red; un programa que pasa mucho tiempo sin tocarla no contesta entre tanto
+  (ni a pings ni a los datos que le envían). Sólo se ha probado con la red
+  emulada de PCSX2, que además no devuelve los rechazos de conexión (un puerto
+  cerrado del PC se ve como una conexión que caduca) ni admite conexiones
+  entrantes desde fuera; el driver del adaptador sigue el hardware real pero
+  no se ha ejecutado en él.
 - **OpenGL ES 1.0 no es conforme al 100 %**: la mezcla, la comparación de
   profundidad y el entorno de textura tienen las diferencias de la tabla de
-  [OpenGL ES 1.0](#opengl-es-10), que vienen del hardware. La geometría se
-  calcula en la FPU del EE, en escalar: `gles-demo` mide unos 50 000
-  triángulos iluminados por segundo en PCSX2, es decir, cientos por frame a
-  60 Hz, muy lejos de un juego comercial (que usa las unidades vectoriales,
-  sin soporte aquí). No se enlaza con C: es para
+  [OpenGL ES 1.0](#opengl-es-10), que vienen del hardware. La geometría de
+  los triángulos va por la VU1 salvo con brillo especular, focos, niebla
+  exponencial, dos caras o `glPolygonOffset`, que siguen en la FPU del EE
+  (unas siete veces más lento). Con la VU1 el límite lo pone el EE, que aún
+  lee y copia cada vértice: unos 350 000 triángulos por segundo en PCSX2, que
+  no cuenta el tiempo de la VU1 (en una consola irían en paralelo; por el
+  número de instrucciones, la VU1 daría para más del doble). El microprograma
+  va con una instrucción por posición, sin emparejar; hay margen. No se enlaza con C: es para
   programas en Rust. En PCSX2 con renderizado por hardware, `glReadPixels`
   puede no ver el borde derecho e inferior de puntos y líneas recién dibujados
   (el emulador sólo devuelve la zona que cree dibujada); en pantalla están.
